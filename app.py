@@ -133,5 +133,24 @@ def serve_index():
 def serve_static(path):
     return send_from_directory('.', path)
 
+@app.route('/data/all_deltas')
+def get_all_deltas():
+    # Return a 2D array (51x51) of magic_number (Delta) values
+    # x is horizontal, y is vertical
+    deltas = []
+    for y in range(51):
+        row = []
+        for x in range(51):
+            h_idx = 50 - x
+            v_idx = y
+            key = f"{h_idx}_{v_idx}"
+            if key in precomputed_data:
+                row.append(precomputed_data[key]['magic_number'])
+            else:
+                row.append(0)
+        deltas.append(row)
+    return jsonify({"deltas": deltas})
+
 if __name__ == '__main__':
-    app.run(port=8080)
+    print("Pre-computation complete! Starting server...")
+    app.run(debug=True, port=8080)
