@@ -43,7 +43,7 @@ def main():
 
     rs = rs_raw - calibration_shift
 
-    precomputed_data = {}
+    precomputed_data = {'pixels': {}}
     
     # Define physical bounds to prevent peak collapse
     bounds = (
@@ -150,32 +150,39 @@ def main():
                     r2_mos2 = 0
                     fit_success = False
             
-            precomputed_data[f"{h}_{v}"] = {
-                'rs': rs.tolist(),
-                'norm_spec': norm_spec.tolist(),
-                'x_fit': x_fit.tolist(),
-                'y_fit_curve': y_fit_curve.tolist(),
-                'L1_curve': L1_curve.tolist(),
-                'L2_curve': L2_curve.tolist(),
-                'x_si': x_si.tolist(),
-                'y_si': ((np.array(y_si) - bg_noise) / l_max).tolist(),
-                'y_si_curve': ((np.array(y_si_curve) - bg_noise) / l_max).tolist(),
-                'si_c': float(c_si),
-                'si_fwhm': float(2 * abs(w_si)),
-                'r2_si': float(r2_si),
-                'r2_mos2': float(r2_mos2),
-                'bg_noise': float(bg_noise),
-                'c1': float(c1),
-                'fwhm1': float(fwhm1),
-                'c2': float(c2),
-                'fwhm2': float(fwhm2),
+            # Round data to 3 decimal places to drastically reduce JSON string size
+            precomputed_data['pixels'][f"{h}_{v}"] = {
+                'norm_spec': np.round(norm_spec, 3).tolist(),
+                'y_fit_curve': np.round(y_fit_curve, 3).tolist(),
+                'L1_curve': np.round(L1_curve, 3).tolist(),
+                'L2_curve': np.round(L2_curve, 3).tolist(),
+                'y_si': np.round((np.array(y_si) - bg_noise) / l_max, 3).tolist(),
+                'y_si_curve': np.round((np.array(y_si_curve) - bg_noise) / l_max, 3).tolist(),
+                'si_c': round(float(c_si), 3),
+                'si_fwhm': round(float(2 * abs(w_si)), 3),
+                'r2_si': round(float(r2_si), 4),
+                'r2_mos2': round(float(r2_mos2), 4),
+                'bg_noise': round(float(bg_noise), 2),
+                'c1': round(float(c1), 3),
+                'fwhm1': round(float(fwhm1), 3),
+                'c2': round(float(c2), 3),
+                'fwhm2': round(float(fwhm2), 3),
                 'integrated_intensity': float(integrated_intensity),
-                'magic_number': float(magic_number),
+                'magic_number': round(float(magic_number), 3),
                 'fit_success': fit_success
             }
+            
+            # Store the x-axis arrays only once globally to save space
+            if 'global_axes' not in precomputed_data:
+                precomputed_data['global_axes'] = {
+                    'rs': np.round(rs, 3).tolist(),
+                    'x_fit': np.round(x_fit, 3).tolist(),
+                    'x_si': np.round(x_si, 3).tolist()
+                }
 
     with open('precomputed_data.tmp.json', 'w') as out_f:
-        json.dump(precomputed_data, out_f)
+        # Use separators=(',', ':') to remove whitespace in JSON
+        json.dump(precomputed_data, out_f, separators=(',', ':'))
     os.rename('precomputed_data.tmp.json', 'precomputed_data.json')
 
     end_time = time.time()

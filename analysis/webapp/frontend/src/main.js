@@ -38,6 +38,7 @@ Plotly.newPlot('chart', [], {
 
 let currentX = -1
 let currentY = -1
+let precomputedData = null
 
 function getColorForDelta(delta) {
     if (delta >= 17.5 && delta < 19.5) return '#ff4d4d' // Red
@@ -46,17 +47,14 @@ function getColorForDelta(delta) {
     return '#222' // Other / Substrate
 }
 
-async function initGrid(retries = 30) {
-    if (retries === 30) {
-        grid.innerHTML = '<div style="color: #ccc; padding: 20px;">Waiting for Flask backend to finish pre-computing 2,600 Lorentzians... (~10-15s)</div>'
-    }
+async function initGrid() {
+    grid.innerHTML = '<div style="color: #ccc; padding: 20px;">Downloading pre-computed data payload (~10MB)...</div>'
     
     try {
-        const response = await fetch('/data/all_deltas')
-        if (!response.ok) throw new Error("Backend returned " + response.status)
-        const data = await response.json()
-        const deltas = data.deltas // 51x51 array (y, x)
-
+        const response = await fetch('data.json')
+        if (!response.ok) throw new Error("Could not load data.json")
+        precomputedData = await response.json()
+        
         grid.innerHTML = '' // Clear loading text
         
         for (let y = 0; y < 51; y++) {
@@ -64,7 +62,11 @@ async function initGrid(retries = 30) {
                 const pixel = document.createElement('div')
                 pixel.className = 'grid-pixel'
                 
-                const delta = deltas[y][x]
+                const h_idx = 50 - x;
+                const key = `${h_idx}_${y}`;
+                const pixelData = precomputedData.pixels ? precomputedData.pixels[key] : null;
+                const delta = pixelData ? pixelData.magic_number : 0;
+
                 pixel.style.backgroundColor = getColorForDelta(delta)
                 
                 pixel.addEventListener('mouseenter', () => {
@@ -80,23 +82,21 @@ async function initGrid(retries = 30) {
             }
         }
     } catch (e) {
-        console.warn("Backend not ready yet, retrying...", e)
-        if (retries > 0) {
-            setTimeout(() => initGrid(retries - 1), 1000)
-        } else {
-            grid.innerHTML = '<div style="color: #ff4d4d; padding: 20px;">Failed to connect to backend. Please ensure Flask is running.</div>'
-        }
+        console.error("Failed to load static data:", e)
+        grid.innerHTML = '<div style="color: #ff4d4d; padding: 20px;">Failed to load data.json. Ensure you have run precompute.py and copied the file to the public directory.</div>'
     }
 }
 
-async function fetchSpectrum(x, y) {
-    try {
-        const response = await fetch(`/data/${x}/${y}`);
-        if (!response.ok) return;
-        const data = await response.json();
+function fetchSpectrum(x, y) {
+    if (!precomputedData || !precomputedData.pixels) return;
+    const h_idx = 50 - x;
+    const key = `${h_idx}_${y}`;
+    const data = precomputedData.pixels[key];
+    if (data) {
+        data.rs = precomputedData.global_axes.rs;
+        data.x_fit = precomputedData.global_axes.x_fit;
+        data.x_si = precomputedData.global_axes.x_si;
         updateChart(data, x, y);
-    } catch (error) {
-        console.error("Error fetching spectrum data:", error);
     }
 }
 
