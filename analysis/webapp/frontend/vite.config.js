@@ -1,5 +1,12 @@
 import { defineConfig } from 'vite'
 
 export default defineConfig({
-  base: './', // Ensures assets are loaded with relative paths, perfect for GitHub Pages
+  base: './',
+  server: {
+    proxy: {
+      '/upload': 'http://127.0.0.1:8080',
+      '/datasets': 'http://127.0.0.1:8080',
+      '/api': 'http://127.0.0.1:8080'
+    }
+  }
 })

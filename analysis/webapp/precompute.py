@@ -25,10 +25,9 @@ def clean_cosmic_rays(rs, y):
     cleaned_y[spike_idx] = med[spike_idx]
     return cleaned_y
 
-def main():
-    print("Loading dataset and pre-computing fits...")
+def process_h5(h5_path):
+    print(f"Loading dataset {h5_path} and pre-computing fits...")
     start_time = time.time()
-    h5_path = '../../MAPPING.h5'
     f = h5py.File(h5_path, 'r')
     rs_raw = f['measurement']['hyperspec_picam_mcl']['raman_shifts'][:]
     spec_map = f['measurement']['hyperspec_picam_mcl']['spec_map'][0]
@@ -180,13 +179,17 @@ def main():
                     'x_si': np.round(x_si, 3).tolist()
                 }
 
+    end_time = time.time()
+    print(f"Pre-computation complete! Took {end_time - start_time:.2f} seconds.")
+    return precomputed_data
+
+def main():
+    h5_path = '../../MAPPING.h5'
+    precomputed_data = process_h5(h5_path)
     with open('precomputed_data.tmp.json', 'w') as out_f:
-        # Use separators=(',', ':') to remove whitespace in JSON
         json.dump(precomputed_data, out_f, separators=(',', ':'))
     os.rename('precomputed_data.tmp.json', 'precomputed_data.json')
-
-    end_time = time.time()
-    print(f"Pre-computation complete and saved to disk! Took {end_time - start_time:.2f} seconds.")
+    print("Saved to disk as precomputed_data.json")
 
 if __name__ == '__main__':
     main()
