@@ -42,6 +42,34 @@ def get_file_hash(filepath):
             h.update(chunk)
     return h.hexdigest()
 
+def load_persisted_datasets():
+    print("Scanning uploads directory for datasets...")
+    for filename in os.listdir(UPLOAD_FOLDER):
+        if filename.endswith('.h5'):
+            filepath = os.path.join(UPLOAD_FOLDER, filename)
+            file_hash = get_file_hash(filepath)
+            dataset_id = file_hash[:8]
+            
+            file_hashes[file_hash] = dataset_id
+            dataset_names[dataset_id] = filename
+            
+            json_filepath = os.path.join(UPLOAD_FOLDER, f"{dataset_id}.json")
+            if os.path.exists(json_filepath):
+                print(f"Loading cached fits for {dataset_id}...")
+                with open(json_filepath, 'r') as f:
+                    datasets[dataset_id] = json.load(f)
+            else:
+                print(f"Precomputing fits for new file {filename}...")
+                try:
+                    data = process_h5(filepath)
+                    datasets[dataset_id] = data
+                    with open(json_filepath, 'w') as f:
+                        json.dump(data, f, separators=(',', ':'))
+                except Exception as e:
+                    print(f"Failed to process {filename}: {e}")
+
+load_persisted_datasets()
+
 @app.route('/upload', methods=['POST'])
 def upload_file():
     if 'file' not in request.files:
@@ -78,6 +106,11 @@ def upload_file():
             datasets[dataset_id] = data
             file_hashes[file_hash] = dataset_id
             dataset_names[dataset_id] = filename
+            
+            # Save the processed data to disk to save time on next startup
+            json_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{dataset_id}.json")
+            with open(json_filepath, 'w') as f:
+                json.dump(data, f, separators=(',', ':'))
             
             return jsonify({
                 "message": "File processed successfully",
