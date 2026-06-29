@@ -16,7 +16,7 @@ from werkzeug.utils import secure_filename
 from flask import Flask, jsonify, send_from_directory, request
 from precompute import process_h5
 
-app = Flask(__name__, static_folder='.')
+app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
 
 datasets = {}
 file_hashes = {}
@@ -136,11 +136,12 @@ def get_dataset(dataset_id):
 
 @app.route('/')
 def serve_index():
-    return send_from_directory('.', 'index.html')
+    return app.send_static_file('index.html')
 
 @app.route('/<path:path>')
 def serve_static(path):
-    return send_from_directory('.', path)
+    # Try to serve the static file. If it fails, fallback to something else if needed.
+    return app.send_static_file(path)
 
 if __name__ == '__main__':
     print("Starting server...")
