@@ -6,6 +6,13 @@ import Plotly from 'plotly.js-dist-min'
 document.querySelector('#app').innerHTML = `
   <div class="left-panel">
       <h2>Hyperspectral Map Grid (Hover to Analyze)</h2>
+      <div style="margin-bottom: 10px; display: flex; gap: 10px; align-items: center;">
+          <select id="dataset-select" style="padding: 5px; background: #333; color: white; border: 1px solid #555; flex: 1;">
+              <option value="">Loading datasets...</option>
+          </select>
+          <input type="file" id="file-upload" accept=".h5" style="display: none;" />
+          <button id="upload-btn" style="padding: 5px 10px; background: #4d4dff; border: none; color: white; cursor: pointer; border-radius: 3px;">Upload .h5</button>
+      </div>
       <div class="grid-container" id="grid">
         <!-- Pixels will be injected here -->
       </div>
@@ -27,6 +34,9 @@ document.querySelector('#app').innerHTML = `
 
 const grid = document.getElementById('grid')
 const coordText = document.getElementById('coord-text')
+const datasetSelect = document.getElementById('dataset-select')
+const uploadBtn = document.getElementById('upload-btn')
+const fileUpload = document.getElementById('file-upload')
 
 // Initialize empty chart
 Plotly.newPlot('chart', [], {
@@ -47,12 +57,76 @@ function getColorForDelta(delta) {
     return '#222' // Other / Substrate
 }
 
-async function initGrid() {
-    grid.innerHTML = '<div style="color: #ccc; padding: 20px;">Downloading pre-computed data payload (~10MB)...</div>'
+async function loadDatasets() {
+    try {
+        const res = await fetch('/datasets')
+        const data = await res.json()
+        datasetSelect.innerHTML = ''
+        if (data.datasets.length === 0) {
+            datasetSelect.innerHTML = '<option value="">No datasets available</option>'
+            return
+        }
+        data.datasets.forEach(id => {
+            const opt = document.createElement('option')
+            opt.value = id
+            opt.textContent = id
+            datasetSelect.appendChild(opt)
+        })
+        datasetSelect.value = data.datasets.includes('default') ? 'default' : data.datasets[0]
+        initGrid(datasetSelect.value)
+    } catch (e) {
+        console.error(e)
+    }
+}
+
+datasetSelect.addEventListener('change', () => {
+    if (datasetSelect.value) initGrid(datasetSelect.value)
+})
+
+uploadBtn.addEventListener('click', () => fileUpload.click())
+
+fileUpload.addEventListener('change', async (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+    
+    uploadBtn.textContent = 'Uploading/Processing...'
+    uploadBtn.disabled = true
+    
+    const formData = new FormData()
+    formData.append('file', file)
     
     try {
-        const response = await fetch('data.json')
-        if (!response.ok) throw new Error("Could not load data.json")
+        const res = await fetch('/upload', { method: 'POST', body: formData })
+        if (!res.ok) throw new Error("Upload failed")
+        const data = await res.json()
+        if (data.duplicate) {
+            alert(data.message)
+        }
+        await loadDatasets()
+        datasetSelect.value = data.dataset_id
+        initGrid(data.dataset_id)
+    } catch (err) {
+        alert(err.message)
+    } finally {
+        uploadBtn.textContent = 'Upload .h5'
+        uploadBtn.disabled = false
+        fileUpload.value = ''
+    }
+})
+
+async function initGrid(datasetId) {
+    grid.innerHTML = '<div style="color: #ccc; padding: 20px;">Downloading data payload...</div>'
+    precomputedData = null
+    Plotly.react('chart', [], {
+        title: 'Hover over a pixel to view spectra',
+        paper_bgcolor: '#1e1e1e',
+        plot_bgcolor: '#1e1e1e',
+        font: { color: '#e0e0e0' }
+    })
+    
+    try {
+        const response = await fetch(`/api/data/${datasetId}`)
+        if (!response.ok) throw new Error("Could not load dataset")
         precomputedData = await response.json()
         
         grid.innerHTML = '' // Clear loading text
@@ -83,7 +157,7 @@ async function initGrid() {
         }
     } catch (e) {
         console.error("Failed to load static data:", e)
-        grid.innerHTML = '<div style="color: #ff4d4d; padding: 20px;">Failed to load data.json. Ensure you have run precompute.py and copied the file to the public directory.</div>'
+        grid.innerHTML = '<div style="color: #ff4d4d; padding: 20px;">Failed to load dataset.</div>'
     }
 }
 
@@ -197,4 +271,4 @@ function updateChart(data, x, y) {
 }
 
 // Start app
-initGrid()
+loadDatasets()
