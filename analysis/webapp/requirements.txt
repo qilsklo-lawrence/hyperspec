@@ -1,0 +1,6 @@
+Flask
+h5py
+numpy
+scipy
+Werkzeug
+gunicorn
