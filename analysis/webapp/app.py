@@ -25,11 +25,13 @@ dataset_names = {}
 # Load default data if exists
 default_data_path = 'precomputed_data.json'
 if os.path.exists(default_data_path):
-    with open(default_data_path, 'r') as f:
-        datasets['default'] = json.load(f)
-        dataset_names['default'] = 'default (MAPPING.h5)'
-        # If we wanted to track the hash of the default, we could hash MAPPING.h5 here, 
-        # but it might not be available relative to the backend. We'll just track uploaded file hashes.
+    try:
+        with open(default_data_path, 'r') as f:
+            datasets['default'] = json.load(f)
+            dataset_names['default'] = 'default (MAPPING.h5)'
+    except json.JSONDecodeError:
+        print("Warning: precomputed_data.json is corrupted or is a Git LFS pointer file. Default dataset will not be loaded.")
+        # If the file is a Git LFS pointer, it won't load, but the server will still run.
 
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
