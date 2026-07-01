@@ -29,8 +29,24 @@ def process_h5(h5_path):
     print(f"Loading dataset {h5_path} and pre-computing fits...")
     start_time = time.time()
     f = h5py.File(h5_path, 'r')
-    rs_raw = f['measurement']['hyperspec_picam_mcl']['raman_shifts'][:]
-    spec_map = f['measurement']['hyperspec_picam_mcl']['spec_map'][0]
+    if 'measurement' not in f:
+        raise ValueError("Invalid H5 file format. Expected 'measurement' group.")
+        
+    if 'hyperspec_picam_mcl' in f['measurement']:
+        meas = f['measurement']['hyperspec_picam_mcl']
+        rs_raw = meas['raman_shifts'][:]
+        spec_map_raw = meas['spec_map'][:]
+        spec_map = spec_map_raw[0]
+    elif 'piezo_hyperspec' in f['measurement']:
+        meas = f['measurement']['piezo_hyperspec']
+        wls = meas['wls'][:]
+        rs_raw = (1/532.0 - 1/wls) * 1e7
+        spec_map_raw = meas['spec_map'][:]
+        spec_map = spec_map_raw[0, :, :, 0, :]
+    else:
+        raise ValueError("Invalid H5 file format. Expected 'hyperspec_picam_mcl' or 'piezo_hyperspec' inside 'measurement'.")
+        
+    v_steps, h_steps, _ = spec_map.shape
 
     # Calculate global Si calibration shift for this dataset
     mean_spec = np.mean(spec_map, axis=(0, 1))
@@ -50,8 +66,8 @@ def process_h5(h5_path):
         [np.inf, np.inf, 395, 20, np.inf, 420, 20]
     )
 
-    for v in range(51):
-        for h in range(51):
+    for v in range(v_steps):
+        for h in range(h_steps):
             spec = spec_map[v, h, :]
             spec = clean_cosmic_rays(rs, spec)
             
@@ -176,7 +192,9 @@ def process_h5(h5_path):
                 precomputed_data['global_axes'] = {
                     'rs': np.round(rs, 3).tolist(),
                     'x_fit': np.round(x_fit, 3).tolist(),
-                    'x_si': np.round(x_si, 3).tolist()
+                    'x_si': np.round(x_si, 3).tolist(),
+                    'width': h_steps,
+                    'height': v_steps
                 }
 
     end_time = time.time()

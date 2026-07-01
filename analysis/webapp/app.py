@@ -23,7 +23,8 @@ file_hashes = {}
 dataset_names = {}
 
 # Load default data if exists
-default_data_path = 'precomputed_data.json'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+default_data_path = os.path.join(BASE_DIR, 'precomputed_data.json')
 if os.path.exists(default_data_path):
     try:
         with open(default_data_path, 'r') as f:
@@ -33,7 +34,7 @@ if os.path.exists(default_data_path):
         print("Warning: precomputed_data.json is corrupted or is a Git LFS pointer file. Default dataset will not be loaded.")
         # If the file is a Git LFS pointer, it won't load, but the server will still run.
 
-UPLOAD_FOLDER = 'uploads'
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
