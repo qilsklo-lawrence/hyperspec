@@ -97,8 +97,8 @@ fileUpload.addEventListener('change', async (e) => {
     
     try {
         const res = await fetch('/upload', { method: 'POST', body: formData })
-        if (!res.ok) throw new Error("Upload failed")
         const data = await res.json()
+        if (!res.ok) throw new Error(data.error || "Upload failed")
         if (data.duplicate) {
             alert(data.message)
         }
@@ -131,12 +131,20 @@ async function initGrid(datasetId) {
         
         grid.innerHTML = '' // Clear loading text
         
-        for (let y = 0; y < 51; y++) {
-            for (let x = 0; x < 51; x++) {
+        const width = precomputedData.global_axes.width || 51;
+        const height = precomputedData.global_axes.height || 51;
+        
+        grid.style.gridTemplateColumns = `repeat(${width}, 10px)`;
+        grid.style.gridTemplateRows = `repeat(${height}, 10px)`;
+        grid.style.width = `${width * 10}px`;
+        grid.style.height = `${height * 10}px`;
+        
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
                 const pixel = document.createElement('div')
                 pixel.className = 'grid-pixel'
                 
-                const h_idx = 50 - x;
+                const h_idx = (width - 1) - x;
                 const key = `${h_idx}_${y}`;
                 const pixelData = precomputedData.pixels ? precomputedData.pixels[key] : null;
                 const delta = pixelData ? pixelData.magic_number : 0;
@@ -163,7 +171,8 @@ async function initGrid(datasetId) {
 
 function fetchSpectrum(x, y) {
     if (!precomputedData || !precomputedData.pixels) return;
-    const h_idx = 50 - x;
+    const width = precomputedData.global_axes.width || 51;
+    const h_idx = (width - 1) - x;
     const key = `${h_idx}_${y}`;
     const data = precomputedData.pixels[key];
     if (data) {
