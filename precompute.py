@@ -43,6 +43,9 @@ def recommend_peak_count(x, y, min_distance=20):
     return len(peaks), peaks
 
 def process_h5(h5_path, progress_callback=None):
+    if h5_path.lower().endswith('.mat'):
+        return process_mat(h5_path, progress_callback)
+        
     print(f"Loading dataset {h5_path} for fast preview...")
     start_time = time.time()
     f = h5py.File(h5_path, 'r')
@@ -89,9 +92,17 @@ def process_h5(h5_path, progress_callback=None):
             spec_sub = spec - bg_noise
             l_max = np.max(spec_sub) if np.max(spec_sub) > 0 else 1.0
             norm_spec = spec_sub / l_max
+            norm_spec = np.nan_to_num(norm_spec, nan=0.0)
             
             # Magic number for heatmap: Total integrated intensity
             magic_number = float(np.sum(spec_sub))
+            if np.isnan(magic_number): magic_number = 0.0
+            
+            # Compute sharpness
+            sharpness = float(np.max(spec_sub) / magic_number) if magic_number > 0 else 0.0
+            if np.isnan(sharpness): sharpness = 0.0
+            bg_noise = 0.0 if np.isnan(bg_noise) else float(bg_noise)
+            l_max = 0.0 if np.isnan(l_max) else float(l_max)
             
             current_max_y = np.max(norm_spec)
             if current_max_y > global_max_y: global_max_y = current_max_y
@@ -103,11 +114,131 @@ def process_h5(h5_path, progress_callback=None):
             precomputed_data['pixels'][f"{h}_{v}"] = {
                 'norm_spec': np.round(norm_spec, 3).tolist(),
                 'integrated_intensity': magic_number,
+                'sharpness': sharpness,
                 'bg_noise': round(float(bg_noise), 2),
                 'l_max': round(float(l_max), 2),
                 'num_peaks': num_peaks,
                 'peak_indices': peak_indices,
                 # Fit fields initialized empty
+                'fit_curves': [],
+                'fit_success': False
+            }
+
+    precomputed_data['global_axes'] = {
+        'rs': np.round(rs, 3).tolist(),
+        'wls': np.round(wls, 3).tolist(),
+        'width': h_steps,
+        'height': v_steps,
+        'min_y': float(global_min_y),
+        'max_y': float(global_max_y)
+    }
+
+    if progress_callback:
+        progress_callback(total_pixels, total_pixels, "Finished precomputing")
+
+    end_time = time.time()
+    print(f"Fast initial processing complete! Took {end_time - start_time:.2f} seconds.")
+    return precomputed_data
+
+def process_mat(mat_path, progress_callback=None):
+    print(f"Loading dataset {mat_path} for fast preview...")
+    start_time = time.time()
+    
+    import scipy.io as sio
+    try:
+        mat = sio.loadmat(mat_path)
+        share = mat['share'][0, 0]
+        
+        uniqueX = share['uniqueX'].flatten()
+        uniqueY = share['uniqueY'].flatten()
+        index_map = share['index_map']
+        raw = share['raw']
+        wls = share['wl'].flatten()
+        
+        if 'sharpness_map' in share.dtype.names:
+            sharpness_map = share['sharpness_map'].flatten()
+        else:
+            sharpness_map = None
+            
+        is_h5 = False
+    except NotImplementedError:
+        # Fallback to h5py for v7.3 .mat files
+        f = h5py.File(mat_path, 'r')
+        share = f['share']
+        
+        uniqueX = share['uniqueX'][:].flatten()
+        uniqueY = share['uniqueY'][:].flatten()
+        index_map = share['index_map'][:].T # HDF5 transposes
+        raw = share['raw'][:].T # HDF5 transposes
+        wls = share['wl'][:].flatten()
+        
+        if 'sharpness_map' in share:
+            sharpness_map = share['sharpness_map'][:].flatten()
+        else:
+            sharpness_map = None
+            
+        is_h5 = True
+
+    h_steps = len(uniqueX)
+    v_steps = len(uniqueY)
+    
+    precomputed_data = {'pixels': {}}
+    
+    total_pixels = v_steps * h_steps
+    pixel_count = 0
+
+    global_min_y = float('inf')
+    global_max_y = float('-inf')
+
+    # Convert wls to rs roughly if needed
+    rs = (1/532.0 - 1/wls) * 1e7
+
+    for y_idx in range(v_steps):
+        for x_idx in range(h_steps):
+            pixel_count += 1
+            if progress_callback and pixel_count % 200 == 0:
+                progress_callback(pixel_count, total_pixels, f"Processing pixel {x_idx}, {y_idx}")
+
+            mat_idx = index_map[y_idx, x_idx]
+            
+            if np.isnan(mat_idx):
+                continue
+                
+            idx = int(mat_idx) - 1 # 1-based indexing in Matlab
+            spec = raw[idx, :]
+            
+            bg_noise = np.percentile(spec, 5) 
+            spec_sub = spec - bg_noise
+            l_max = np.max(spec_sub) if np.max(spec_sub) > 0 else 1.0
+            norm_spec = spec_sub / l_max
+            norm_spec = np.nan_to_num(norm_spec, nan=0.0)
+            
+            magic_number = float(np.sum(spec_sub))
+            if np.isnan(magic_number): magic_number = 0.0
+            
+            if sharpness_map is not None:
+                s_val = float(sharpness_map[idx])
+                sharpness = 0.0 if np.isnan(s_val) else s_val
+            else:
+                sharpness = float(np.max(spec_sub) / magic_number) if magic_number > 0 else 0.0
+                if np.isnan(sharpness): sharpness = 0.0
+            bg_noise = 0.0 if np.isnan(bg_noise) else float(bg_noise)
+            l_max = 0.0 if np.isnan(l_max) else float(l_max)
+            
+            current_max_y = np.max(norm_spec)
+            if current_max_y > global_max_y: global_max_y = current_max_y
+            if np.min(norm_spec) < global_min_y: global_min_y = np.min(norm_spec)
+            
+            num_peaks, peak_indices = recommend_peak_count(rs, norm_spec)
+
+            precomputed_data['pixels'][f"{x_idx}_{y_idx}"] = {
+                'norm_spec': np.round(norm_spec, 3).tolist(),
+                'integrated_intensity': magic_number,
+                'sharpness': sharpness,
+                'bg_noise': round(float(bg_noise), 2),
+                'l_max': round(float(l_max), 2),
+                'num_peaks': num_peaks,
+                'peak_indices': peak_indices,
                 'fit_curves': [],
                 'fit_success': False
             }

@@ -14,12 +14,33 @@ document.querySelector('#app').innerHTML = `
               <button id="delete-btn" style="padding: 5px; background: #cc0000; border: none; color: white; cursor: pointer; border-radius: 3px;">Delete</button>
           </div>
           <div style="display: flex; gap: 5px; width: 100%;">
-              <input type="file" id="file-upload" accept=".h5" style="display: none;" />
-              <button id="upload-btn" style="padding: 5px 10px; background: #4d4dff; border: none; color: white; cursor: pointer; border-radius: 3px; flex: 1;">Upload .h5</button>
+              <input type="file" id="file-upload" accept=".h5,.mat" style="display: none;" />
+              <button id="upload-btn" style="padding: 5px 10px; background: #4d4dff; border: none; color: white; cursor: pointer; border-radius: 3px; flex: 1;">Upload Data</button>
               <button id="fit-btn" style="padding: 5px 10px; background: #ff4d4d; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Fit!</button>
               <button id="toggle-fits-btn" style="padding: 5px 10px; background: #888; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Hide Fits</button>
           </div>
           <div id="upload-status" style="font-size: 12px; color: #aaa; text-align: center;"></div>
+      </div>
+      
+      <div style="margin-bottom: 10px; display: flex; flex-direction: column; gap: 5px; width: 100%; border: 1px solid #444; padding: 10px; border-radius: 4px; box-sizing: border-box;">
+          <div style="display: flex; gap: 5px; width: 100%; align-items: center;">
+              <label style="color: #ccc; font-size: 12px; width: 80px;">Map Type:</label>
+              <select id="map-type-select" style="padding: 3px; background: #333; color: white; border: 1px solid #555; flex: 1;">
+                  <option value="integrated_intensity">Integrated Intensity</option>
+                  <option value="l_max">Max Intensity</option>
+                  <option value="sharpness">Sharpness</option>
+              </select>
+          </div>
+          <div style="display: flex; gap: 5px; width: 100%; align-items: center;">
+              <label style="color: #ccc; font-size: 12px; width: 80px;">Min %:</label>
+              <input type="range" id="contrast-min" min="0" max="100" step="0.1" value="0" style="flex: 1;">
+              <span id="contrast-min-val" style="color: #ccc; font-size: 12px; width: 40px; cursor: text;" title="Double click to edit">0%</span>
+          </div>
+          <div style="display: flex; gap: 5px; width: 100%; align-items: center;">
+              <label style="color: #ccc; font-size: 12px; width: 80px;">Max %:</label>
+              <input type="range" id="contrast-max" min="0" max="100" step="0.1" value="100" style="flex: 1;">
+              <span id="contrast-max-val" style="color: #ccc; font-size: 12px; width: 40px; cursor: text;" title="Double click to edit">100%</span>
+          </div>
       </div>
       
       <div class="grid-container" id="grid">
@@ -90,6 +111,114 @@ const unitSelect = document.getElementById('unit-select')
 const resetZoomBtn = document.getElementById('reset-zoom-btn')
 const renameBtn = document.getElementById('rename-btn')
 const toggleFitsBtn = document.getElementById('toggle-fits-btn')
+const mapTypeSelect = document.getElementById('map-type-select')
+const contrastMin = document.getElementById('contrast-min')
+const contrastMax = document.getElementById('contrast-max')
+const contrastMinVal = document.getElementById('contrast-min-val')
+const contrastMaxVal = document.getElementById('contrast-max-val')
+
+mapTypeSelect.addEventListener('change', () => updateHeatmap())
+contrastMin.addEventListener('input', () => {
+    contrastMinVal.textContent = parseFloat(contrastMin.value).toFixed(1).replace(/\.0$/, '') + '%';
+    updateHeatmap();
+})
+contrastMax.addEventListener('input', () => {
+    contrastMaxVal.textContent = parseFloat(contrastMax.value).toFixed(1).replace(/\.0$/, '') + '%';
+    updateHeatmap();
+})
+
+function makeEditable(spanEl, inputEl, callback) {
+    spanEl.addEventListener('dblclick', () => {
+        const currentVal = parseFloat(inputEl.value);
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.step = '0.1';
+        input.style.width = '45px';
+        input.style.fontSize = '12px';
+        input.style.background = '#333';
+        input.style.color = '#fff';
+        input.style.border = '1px solid #555';
+        input.value = currentVal;
+        
+        const save = () => {
+            let val = parseFloat(input.value);
+            if (isNaN(val)) val = currentVal;
+            if (val < 0) val = 0;
+            if (val > 100) val = 100;
+            val = Math.floor(val * 10) / 10; // truncate to tenths place
+            inputEl.value = val;
+            spanEl.textContent = val.toFixed(1).replace(/\.0$/, '') + '%';
+            spanEl.style.display = '';
+            if (input.parentNode) input.parentNode.removeChild(input);
+            callback();
+        };
+        
+        input.addEventListener('blur', save);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') save();
+            if (e.key === 'Escape') {
+                spanEl.style.display = '';
+                if (input.parentNode) input.parentNode.removeChild(input);
+            }
+        });
+        
+        spanEl.style.display = 'none';
+        spanEl.parentNode.insertBefore(input, spanEl.nextSibling);
+        input.focus();
+        input.select();
+    });
+}
+
+makeEditable(contrastMinVal, contrastMin, updateHeatmap);
+makeEditable(contrastMaxVal, contrastMax, updateHeatmap);
+
+function updateHeatmap() {
+    if (!precomputedData || !precomputedData.pixels) return;
+    const mapType = mapTypeSelect.value;
+    const minPercent = parseFloat(contrastMin.value) / 100;
+    const maxPercent = parseFloat(contrastMax.value) / 100;
+    
+    let vals = [];
+    for (const key in precomputedData.pixels) {
+        vals.push(precomputedData.pixels[key][mapType]);
+    }
+    
+    if (vals.length === 0) return;
+    
+    vals.sort((a, b) => a - b);
+    
+    let boundMin = vals[Math.floor(minPercent * (vals.length - 1))];
+    let boundMax = vals[Math.floor(maxPercent * (vals.length - 1))];
+    
+    if (boundMin >= boundMax) {
+        boundMax = boundMin + 1e-9;
+    }
+
+    const width = precomputedData.global_axes.width || 51;
+    const height = precomputedData.global_axes.height || 51;
+
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const h_idx = (width - 1) - x;
+            const key = `${h_idx}_${y}`;
+            const pixelData = precomputedData.pixels[key];
+            if (!pixelData) continue;
+            
+            let val = pixelData[mapType];
+            
+            if (val < boundMin) val = boundMin;
+            if (val > boundMax) val = boundMax;
+            
+            const ratio = (val - boundMin) / (boundMax - boundMin);
+            const r = Math.floor(255 * ratio);
+            const b = Math.floor(255 * (1 - ratio));
+            
+            if (pixelElements[key]) {
+                pixelElements[key].style.backgroundColor = `rgb(${r}, 0, ${b})`;
+            }
+        }
+    }
+}
 
 let currentX = -1
 let currentY = -1
@@ -233,7 +362,7 @@ fileUpload.addEventListener('change', async (e) => {
 })
 
 function finishUpload() {
-    uploadBtn.textContent = 'Upload .h5'
+    uploadBtn.textContent = 'Upload Data'
     uploadBtn.disabled = false
     fileUpload.value = ''
     uploadStatus.innerText = ''
@@ -378,17 +507,18 @@ async function initGrid(datasetId) {
         const width = precomputedData.global_axes.width || 51;
         const height = precomputedData.global_axes.height || 51;
         
-        let heatmap_max = 1.0;
-        for (const key in precomputedData.pixels) {
-            if (precomputedData.pixels[key].l_max > heatmap_max) {
-                heatmap_max = precomputedData.pixels[key].l_max;
-            }
-        }
+        const container = document.querySelector('.left-panel');
+        const maxW = container.clientWidth - 60; // 60px for padding
+        const maxH = window.innerHeight - 300; // room for top controls and bottom legend
         
-        grid.style.gridTemplateColumns = `repeat(${width}, 10px)`;
-        grid.style.gridTemplateRows = `repeat(${height}, 10px)`;
-        grid.style.width = `${width * 10}px`;
-        grid.style.height = `${height * 10}px`;
+        let cellSize = Math.floor(Math.min(maxW / width, maxH / height));
+        if (cellSize < 1) cellSize = 1;
+        if (cellSize > 15) cellSize = 15;
+        
+        grid.style.gridTemplateColumns = `repeat(${width}, ${cellSize}px)`;
+        grid.style.gridTemplateRows = `repeat(${height}, ${cellSize}px)`;
+        grid.style.width = `${width * cellSize}px`;
+        grid.style.height = `${height * cellSize}px`;
         
         // Add double click listener to the grid to unlock if clicking anywhere in the plane
         grid.addEventListener('dblclick', () => {
@@ -409,12 +539,6 @@ async function initGrid(datasetId) {
                 const l_max = pixelData && pixelData.l_max ? pixelData.l_max : 0;
                 const num_peaks = pixelData ? pixelData.num_peaks : 0;
 
-                // getColorForIntensity now uses heatmap_max instead of overwriting global_axes.max_y
-                const ratio = Math.min(1.0, l_max / heatmap_max);
-                const r = Math.floor(255 * ratio);
-                const b = Math.floor(255 * (1 - ratio));
-                pixel.style.backgroundColor = `rgb(${r}, 0, ${b})`;
-                
                 pixelElements[key] = pixel;
                 
                 pixel.addEventListener('mouseenter', () => {
@@ -444,6 +568,7 @@ async function initGrid(datasetId) {
             }
         }
         
+        updateHeatmap();
         fitBtn.style.display = 'inline-block';
         toggleFitsBtn.style.display = 'inline-block';
         
@@ -521,8 +646,9 @@ function updateChart(data, x, y, forceRelayout) {
         <div class="stats-box">
             <b>Pixel (${x}, ${y})</b><br>
             Recommended Peaks: ${data.num_peaks}<br>
-            Total Int = ${data.integrated_intensity.toExponential(2)}<br>
-            Bg Noise = ${data.bg_noise.toFixed(2)} a.u.
+            Total Int = ${data.integrated_intensity ? data.integrated_intensity.toExponential(2) : '0.00e+0'}<br>
+            Sharpness = ${data.sharpness !== undefined && data.sharpness !== null ? data.sharpness.toFixed(3) : 'N/A'}<br>
+            Bg Noise = ${data.bg_noise !== undefined ? data.bg_noise.toFixed(2) : '0.00'} a.u.
         </div>
     `;
     

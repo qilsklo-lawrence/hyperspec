@@ -54,34 +54,39 @@ def get_file_hash(filepath):
             h.update(chunk)
     return h.hexdigest()
 
-def load_persisted_datasets():
-    print("Scanning uploads directory for datasets...")
-    for filename in os.listdir(UPLOAD_FOLDER):
-        if filename.endswith('.h5'):
-            filepath = os.path.join(UPLOAD_FOLDER, filename)
-            file_hash = get_file_hash(filepath)
-            dataset_id = file_hash[:8]
-            
-            file_hashes[file_hash] = dataset_id
-            if dataset_id not in dataset_names:
-                dataset_names[dataset_id] = filename
-            
-            json_filepath = os.path.join(UPLOAD_FOLDER, f"{dataset_id}.json")
-            if os.path.exists(json_filepath):
-                print(f"Loading cached fits for {dataset_id}...")
-                with open(json_filepath, 'r') as f:
-                    datasets[dataset_id] = json.load(f)
-            else:
-                print(f"Precomputing fits for new file {filename} in background...")
-                try:
-                    data = process_h5(filepath)
-                    datasets[dataset_id] = data
-                    with open(json_filepath, 'w') as f:
-                        json.dump(data, f, separators=(',', ':'))
-                except Exception as e:
-                    print(f"Failed to process {filename}: {e}")
+def load_single_dataset_from_file(filepath, filename):
+    file_hash = get_file_hash(filepath)
+    dataset_id = file_hash[:8]
+    
+    file_hashes[file_hash] = dataset_id
+    if dataset_id not in dataset_names:
+        dataset_names[dataset_id] = filename
+        save_names_db()
+    
+    json_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{dataset_id}.json")
+    if os.path.exists(json_filepath):
+        print(f"Loading cached fits for {dataset_id} in background...")
+        processing_status[dataset_id] = {'status': 'processing', 'current': 0, 'total': 1, 'message': 'Loading from disk...'}
+        try:
+            with open(json_filepath, 'r') as f:
+                datasets[dataset_id] = json.load(f)
+            processing_status[dataset_id] = {'status': 'done', 'dataset_id': dataset_id}
+        except Exception as e:
+            print(f"Failed to load cached {dataset_id}: {e}")
+            processing_status[dataset_id] = {'status': 'error', 'error': str(e)}
+    else:
+        print(f"Precomputing fits for new file {filename} in background...")
+        process_file_background(filepath, dataset_id, filename)
 
-load_persisted_datasets()
+def load_persisted_datasets_bg():
+    print("Scanning uploads directory for datasets in background...")
+    for filename in os.listdir(UPLOAD_FOLDER):
+        if filename.endswith('.h5') or filename.endswith('.mat'):
+            filepath = os.path.join(UPLOAD_FOLDER, filename)
+            threading.Thread(target=load_single_dataset_from_file, args=(filepath, filename), daemon=True).start()
+
+# Launch in background so server startup is extremely fast
+threading.Thread(target=load_persisted_datasets_bg, daemon=True).start()
 save_names_db()
 
 def process_file_background(filepath, dataset_id, filename):
@@ -114,7 +119,7 @@ def upload_file():
     
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
-    if file and file.filename.endswith('.h5'):
+    if file and (file.filename.endswith('.h5') or file.filename.endswith('.mat')):
         filename = secure_filename(file.filename)
         temp_id = str(uuid.uuid4())
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{temp_id}_{filename}")
@@ -146,7 +151,7 @@ def upload_file():
             "filename": filename,
             "duplicate": False
         })
-    return jsonify({"error": "Invalid file type. Only .h5 allowed."}), 400
+    return jsonify({"error": "Invalid file type. Only .h5 or .mat allowed."}), 400
 
 @app.route('/status/<dataset_id>')
 def get_status(dataset_id):
@@ -159,7 +164,8 @@ def get_status(dataset_id):
 @app.route('/datasets')
 def list_datasets():
     res = []
-    for d_id in datasets.keys():
+    # Return all datasets known by name, even if they are still loading in background
+    for d_id in dataset_names.keys():
         res.append({
             "id": d_id,
             "name": dataset_names.get(d_id, d_id)
@@ -193,9 +199,9 @@ def delete_dataset(dataset_id):
         if os.path.exists(json_path):
             os.remove(json_path)
             
-        # Try to find and remove the h5 file
+        # Try to find and remove the h5/mat file
         for filename in os.listdir(app.config['UPLOAD_FOLDER']):
-            if filename.startswith(f"{dataset_id}_") and filename.endswith('.h5'):
+            if filename.startswith(f"{dataset_id}_") and (filename.endswith('.h5') or filename.endswith('.mat')):
                 h5_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
                 if os.path.exists(h5_path):
                     os.remove(h5_path)
@@ -205,9 +211,14 @@ def delete_dataset(dataset_id):
 
 @app.route('/api/data/<dataset_id>')
 def get_dataset(dataset_id):
-    if dataset_id in datasets:
-        return jsonify(datasets[dataset_id])
-    return jsonify({"error": "Dataset not found"}), 404
+    # Wait for the dataset to finish background processing/loading
+    for _ in range(600): # up to 60 seconds
+        if dataset_id in datasets:
+            return jsonify(datasets[dataset_id])
+        if dataset_id in processing_status and processing_status[dataset_id].get('status') == 'error':
+            return jsonify({"error": processing_status[dataset_id].get('error')}), 500
+        time.sleep(0.1)
+    return jsonify({"error": "Dataset not found or still loading"}), 404
 
 @app.route('/fit_stream/<dataset_id>')
 def fit_stream(dataset_id):
