@@ -1,5 +1,5 @@
 {
-  "name": "mos2-webapp",
+  "name": "hyperspec",
   "version": "1.0.0",
   "scripts": {
     "start-backend": "python -u app.py",
