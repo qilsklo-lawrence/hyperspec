@@ -233,7 +233,7 @@ showFlakeAvgBtn.addEventListener('click', () => {
             automargin: true
         },
         yaxis: { 
-            title: { text: 'Integrated Intensity (a.u.)', standoff: 15 },
+            title: { text: 'Normalized Intensity (a.u.)', standoff: 15 },
             gridcolor: '#444',
             automargin: true
         },
@@ -1003,7 +1003,7 @@ function updateChart(data, x, y, forceRelayout) {
             automargin: true
         },
         yaxis: { 
-            title: { text: 'Integrated Intensity (a.u.)', standoff: 15 },
+            title: { text: 'Normalized Intensity (a.u.)', standoff: 15 },
             gridcolor: '#444',
             automargin: true
         },

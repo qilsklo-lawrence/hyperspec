@@ -6,3 +6,8 @@ uploads/*
 !uploads/MAPPING.h5
 !uploads/default.json
 !uploads/default.h5
+
+
+reset_script.py
+
+frontend/dist/
