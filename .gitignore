@@ -1,2 +1,6 @@
 __pycache__/
-uploads/
+uploads/*
+!uploads/dataset_names.json
+!uploads/MAPPING.h5
+!uploads/default.json
+!uploads/default.h5

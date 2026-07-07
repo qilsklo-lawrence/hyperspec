@@ -32,6 +32,31 @@ def perform_fits(dataset_id, datasets):
     x_data = np.array(dataset['global_axes']['rs'])
     
     for key, pixel in dataset['pixels'].items():
+        if pixel.get('fit_success') and not pixel.get('needs_refit', False):
+            continue
+            
+        pixel['needs_refit'] = False
+        
+        if 'expected_num_peaks' in pixel:
+            target_n = pixel['expected_num_peaks']
+            norm_spec_arr = np.array(pixel['norm_spec'])
+            from scipy.signal import find_peaks
+            from scipy.ndimage import median_filter
+            mask = x_data > 100
+            if not np.any(mask): mask = np.ones_like(x_data, dtype=bool)
+            y_masked = norm_spec_arr[mask]
+            baseline = median_filter(y_masked, size=max(5, len(y_masked)//50))
+            z = y_masked - baseline
+            peaks_masked, props = find_peaks(z, distance=20, prominence=0.001)
+            valid_indices = np.where(mask)[0]
+            if len(peaks_masked) > 0:
+                prominences = props['prominences']
+                top_indices = np.argsort(prominences)[-target_n:][::-1]
+                pixel['peak_indices'] = valid_indices[peaks_masked[top_indices]].tolist()
+            else:
+                pixel['peak_indices'] = [int(valid_indices[np.argmax(y_masked)])]
+            pixel['num_peaks'] = len(pixel['peak_indices'])
+            
         norm_spec = np.array(pixel['norm_spec'])
         peak_indices = pixel['peak_indices']
         

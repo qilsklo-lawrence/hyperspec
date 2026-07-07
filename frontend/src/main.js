@@ -18,6 +18,7 @@ document.querySelector('#app').innerHTML = `
               <button id="upload-btn" style="padding: 5px 10px; background: #4d4dff; border: none; color: white; cursor: pointer; border-radius: 3px; flex: 1;">Upload Data</button>
               <button id="fit-btn" style="padding: 5px 10px; background: #ff4d4d; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Fit!</button>
               <button id="toggle-fits-btn" style="padding: 5px 10px; background: #888; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Hide Fits</button>
+              <button id="export-png-btn" style="padding: 5px 10px; background: #009933; border: none; color: white; cursor: pointer; border-radius: 3px;">Export PNG</button>
           </div>
           <div id="upload-status" style="font-size: 12px; color: #aaa; text-align: center;"></div>
       </div>
@@ -111,11 +112,44 @@ const unitSelect = document.getElementById('unit-select')
 const resetZoomBtn = document.getElementById('reset-zoom-btn')
 const renameBtn = document.getElementById('rename-btn')
 const toggleFitsBtn = document.getElementById('toggle-fits-btn')
+const exportPngBtn = document.getElementById('export-png-btn')
 const mapTypeSelect = document.getElementById('map-type-select')
 const contrastMin = document.getElementById('contrast-min')
 const contrastMax = document.getElementById('contrast-max')
 const contrastMinVal = document.getElementById('contrast-min-val')
 const contrastMaxVal = document.getElementById('contrast-max-val')
+
+exportPngBtn.addEventListener('click', () => {
+    if (!precomputedData || !precomputedData.pixels) return;
+    
+    const width = precomputedData.global_axes.width || 51;
+    const height = precomputedData.global_axes.height || 51;
+    
+    const cellSize = 10;
+    
+    const canvas = document.createElement('canvas');
+    canvas.width = width * cellSize;
+    canvas.height = height * cellSize;
+    const ctx = canvas.getContext('2d');
+    
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const h_idx = (width - 1) - x;
+            const key = `${h_idx}_${y}`;
+            const pixelEl = pixelElements[key];
+            if (pixelEl) {
+                ctx.fillStyle = pixelEl.style.backgroundColor || 'black';
+                ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+            }
+        }
+    }
+    
+    const dataUrl = canvas.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = `hyperspectral_map_${datasetSelect.value}_${mapTypeSelect.value}.png`;
+    a.click();
+});
 
 mapTypeSelect.addEventListener('change', () => updateHeatmap())
 contrastMin.addEventListener('input', () => {
@@ -556,11 +590,11 @@ async function initGrid(datasetId) {
                         isLocked = true;
                         currentX = x;
                         currentY = y;
-                        coordText.innerText = `(LOCKED) (${x}, ${y}) - Recommended Peaks: ${num_peaks}`
+                        coordText.innerText = `(LOCKED) (${x}, ${y}) - Recommended Peaks: ${pixelData ? pixelData.num_peaks : 0}`
                         fetchSpectrum(x, y);
                     } else {
                         isLocked = false;
-                        coordText.innerText = `(${x}, ${y}) - Recommended Peaks: ${num_peaks}`
+                        coordText.innerText = `(${x}, ${y}) - Recommended Peaks: ${pixelData ? pixelData.num_peaks : 0}`
                     }
                 });
                 
@@ -645,7 +679,8 @@ function updateChart(data, x, y, forceRelayout) {
     let statsHtml = `
         <div class="stats-box">
             <b>Pixel (${x}, ${y})</b><br>
-            Recommended Peaks: ${data.num_peaks}<br>
+            Expected Peaks: <span id="num-peaks-val" style="color: #4d4dff; cursor: pointer; text-decoration: underline;" title="Click to edit">${data.expected_num_peaks || data.num_peaks}</span>
+            <input type="number" id="num-peaks-input" style="display: none; width: 40px; background: #333; color: white; border: 1px solid #555;" min="1" max="10" step="1"><br>
             Total Int = ${data.integrated_intensity ? data.integrated_intensity.toExponential(2) : '0.00e+0'}<br>
             Sharpness = ${data.sharpness !== undefined && data.sharpness !== null ? data.sharpness.toFixed(3) : 'N/A'}<br>
             Bg Noise = ${data.bg_noise !== undefined ? data.bg_noise.toFixed(2) : '0.00'} a.u.
@@ -667,6 +702,44 @@ function updateChart(data, x, y, forceRelayout) {
     }
 
     document.getElementById('stats-table').innerHTML = statsHtml;
+
+    const numPeaksVal = document.getElementById('num-peaks-val');
+    const numPeaksInput = document.getElementById('num-peaks-input');
+    if (numPeaksVal && numPeaksInput) {
+        numPeaksVal.addEventListener('click', () => {
+            numPeaksInput.value = data.expected_num_peaks || data.num_peaks;
+            numPeaksVal.style.display = 'none';
+            numPeaksInput.style.display = 'inline-block';
+            numPeaksInput.focus();
+        });
+        
+        const savePeaks = async () => {
+            let val = parseInt(numPeaksInput.value);
+            if (!isNaN(val) && val > 0) {
+                data.expected_num_peaks = val;
+                numPeaksVal.textContent = val;
+                
+                const width = precomputedData.global_axes.width;
+                const h_idx = (width - 1) - x;
+                const key = `${h_idx}_${y}`;
+                await fetch(`/update_pixel/${datasetSelect.value}/${key}`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({num_peaks: val})
+                });
+            }
+            numPeaksInput.style.display = 'none';
+            numPeaksVal.style.display = 'inline-block';
+        };
+        numPeaksInput.addEventListener('blur', savePeaks);
+        numPeaksInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') savePeaks();
+            if (e.key === 'Escape') {
+                numPeaksInput.style.display = 'none';
+                numPeaksVal.style.display = 'inline-block';
+            }
+        });
+    }
 
     if (data.fit_success) {
         document.getElementById('info-btn').addEventListener('click', () => {

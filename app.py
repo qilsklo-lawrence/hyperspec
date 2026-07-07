@@ -172,6 +172,17 @@ def list_datasets():
         })
     return jsonify({"datasets": res})
 
+@app.route('/update_pixel/<dataset_id>/<pixel_key>', methods=['POST'])
+def update_pixel(dataset_id, pixel_key):
+    data = request.json
+    if dataset_id in datasets and pixel_key in datasets[dataset_id]['pixels']:
+        pixel = datasets[dataset_id]['pixels'][pixel_key]
+        if 'num_peaks' in data:
+            pixel['expected_num_peaks'] = int(data['num_peaks'])
+            pixel['needs_refit'] = True
+        return jsonify({"success": True})
+    return jsonify({"error": "Dataset or pixel not found"}), 404
+
 @app.route('/rename/<dataset_id>', methods=['POST'])
 def rename_dataset(dataset_id):
     data = request.json
