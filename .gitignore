@@ -1,5 +1,7 @@
 __pycache__/
 uploads/*
+
+# Ensure default is committed to provide portability
 !uploads/dataset_names.json
 !uploads/MAPPING.h5
 !uploads/default.json
