@@ -228,15 +228,17 @@ showFlakeAvgBtn.addEventListener('click', () => {
         plot_bgcolor: '#252525',
         font: { color: '#e0e0e0' },
         xaxis: { 
-            title: xTitle,
-            gridcolor: '#444'
+            title: { text: xTitle, standoff: 15 },
+            gridcolor: '#444',
+            automargin: true
         },
         yaxis: { 
-            title: 'Normalized Intensity (a.u.)',
-            gridcolor: '#444'
+            title: { text: 'Integrated Intensity (a.u.)', standoff: 15 },
+            gridcolor: '#444',
+            automargin: true
         },
         legend: { x: 1, xanchor: 'right', y: 1 },
-        margin: { l: 50, r: 20, t: 40, b: 40 }
+        margin: { l: 60, r: 20, t: 40, b: 60 }
     };
     
     document.getElementById('stats-table').innerHTML = `
@@ -842,6 +844,9 @@ unitSelect.addEventListener('change', () => {
         const width = precomputedData.global_axes.width;
         // When changing units, force relayout so it rescales to new unit ranges
         updateChart(precomputedData.pixels[`${(width - 1) - currentX}_${currentY}`], currentX, currentY, true)
+    } else if (flakeAvgData && isLocked && currentX === -1 && currentY === -1) {
+        // Trigger the flake average render again
+        showFlakeAvgBtn.click();
     }
 })
 
@@ -993,15 +998,17 @@ function updateChart(data, x, y, forceRelayout) {
         plot_bgcolor: '#252525',
         font: { color: '#e0e0e0' },
         xaxis: { 
-            title: xTitle,
-            gridcolor: '#444'
+            title: { text: xTitle, standoff: 15 },
+            gridcolor: '#444',
+            automargin: true
         },
         yaxis: { 
-            title: 'Normalized Intensity (a.u.)',
-            gridcolor: '#444'
+            title: { text: 'Integrated Intensity (a.u.)', standoff: 15 },
+            gridcolor: '#444',
+            automargin: true
         },
         legend: { x: 1, xanchor: 'right', y: 1 },
-        margin: { l: 50, r: 20, t: 40, b: 40 }
+        margin: { l: 60, r: 20, t: 40, b: 60 }
     };
     
     if (xRange && yRange) {
