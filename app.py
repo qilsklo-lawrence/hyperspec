@@ -207,6 +207,91 @@ def reset_all_fits(dataset_id):
         
     return jsonify({"success": True})
 
+@app.route('/detect_flake/<dataset_id>', methods=['GET'])
+def detect_flake(dataset_id):
+    if dataset_id not in datasets:
+        return jsonify({"error": "Dataset not found"}), 404
+        
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return jsonify({"error": "OpenCV not installed on server"}), 500
+        
+    map_type = request.args.get('map_type', 'integrated_intensity')
+    dataset = datasets[dataset_id]
+    
+    width = dataset['global_axes']['width']
+    height = dataset['global_axes']['height']
+    
+    # Reconstruct the 2D grid
+    grid = np.zeros((height, width), dtype=np.float32)
+    valid_pixels = 0
+    for y in range(height):
+        for x in range(width):
+            h_idx = (width - 1) - x
+            key = f"{h_idx}_{y}"
+            if key in dataset['pixels']:
+                grid[y, x] = dataset['pixels'][key].get(map_type, 0.0)
+                valid_pixels += 1
+                
+    if valid_pixels == 0:
+        return jsonify({"error": "No valid data"}), 400
+        
+    min_val = np.min(grid)
+    max_val = np.max(grid)
+    if max_val > min_val:
+        grid_norm = np.uint8(255 * (grid - min_val) / (max_val - min_val))
+    else:
+        grid_norm = np.zeros_like(grid, dtype=np.uint8)
+        
+    blurred = cv2.GaussianBlur(grid_norm, (5, 5), 1.0)
+    
+    # Otsu's thresholding
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Morphological Cleanup
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    cleaned = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
+    
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    best_contour = None
+    best_area = 0
+    total_area = width * height
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < total_area * 0.02:
+            continue
+            
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        if hull_area == 0:
+            continue
+            
+        solidity = area / hull_area
+        
+        if solidity > 0.5:
+            if area > best_area:
+                best_area = area
+                best_contour = cnt
+                
+    if best_contour is None:
+        return jsonify({"error": "Shape not found"}), 404
+        
+    # Simplify contour for frontend rendering
+    epsilon = 0.01 * cv2.arcLength(best_contour, True)
+    approx = cv2.approxPolyDP(best_contour, epsilon, True)
+    
+    points = []
+    for pt in approx:
+        x, y = pt[0]
+        points.append({"x": int(x), "y": int(y)})
+        
+    return jsonify({"points": points})
+
 @app.route('/rename/<dataset_id>', methods=['POST'])
 def rename_dataset(dataset_id):
     data = request.json

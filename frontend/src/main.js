@@ -20,6 +20,7 @@ document.querySelector('#app').innerHTML = `
               <button id="reset-fits-btn" style="padding: 5px 10px; background: #ff8c00; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Reset Fits</button>
               <button id="toggle-fits-btn" style="padding: 5px 10px; background: #888; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Hide Fits</button>
               <button id="export-png-btn" style="padding: 5px 10px; background: #009933; border: none; color: white; cursor: pointer; border-radius: 3px;">Export PNG</button>
+              <button id="detect-flake-btn" style="padding: 5px 10px; background: #8a2be2; border: none; color: white; cursor: pointer; border-radius: 3px;">Outline Flake</button>
           </div>
           <div id="upload-status" style="font-size: 12px; color: #aaa; text-align: center;"></div>
       </div>
@@ -115,6 +116,7 @@ const resetZoomBtn = document.getElementById('reset-zoom-btn')
 const renameBtn = document.getElementById('rename-btn')
 const toggleFitsBtn = document.getElementById('toggle-fits-btn')
 const exportPngBtn = document.getElementById('export-png-btn')
+const detectFlakeBtn = document.getElementById('detect-flake-btn')
 const mapTypeSelect = document.getElementById('map-type-select')
 const contrastMin = document.getElementById('contrast-min')
 const contrastMax = document.getElementById('contrast-max')
@@ -151,6 +153,80 @@ exportPngBtn.addEventListener('click', () => {
     a.href = dataUrl;
     a.download = `hyperspectral_map_${datasetSelect.value}_${mapTypeSelect.value}.png`;
     a.click();
+});
+
+let currentFlakeSvg = null;
+
+detectFlakeBtn.addEventListener('click', async () => {
+    if (!datasetSelect.value) return;
+    
+    if (currentFlakeSvg) {
+        currentFlakeSvg.remove();
+        currentFlakeSvg = null;
+    }
+    
+    detectFlakeBtn.textContent = 'Detecting...';
+    detectFlakeBtn.disabled = true;
+    
+    try {
+        const res = await fetch(`/detect_flake/${datasetSelect.value}?map_type=${mapTypeSelect.value}`);
+        if (!res.ok) {
+            const err = await res.json();
+            alert("Error: " + err.error);
+        } else {
+            const data = await res.json();
+            const points = data.points;
+            
+            const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            svg.style.position = 'absolute';
+            svg.style.top = '0';
+            svg.style.left = '0';
+            svg.style.width = '100%';
+            svg.style.height = '100%';
+            svg.style.pointerEvents = 'none';
+            svg.style.zIndex = '10';
+            
+            const width = precomputedData.global_axes.width || 51;
+            const height = precomputedData.global_axes.height || 51;
+            const container = document.querySelector('.left-panel');
+            const maxW = container.clientWidth - 60;
+            const maxH = window.innerHeight - 300;
+            let cellSize = Math.floor(Math.min(maxW / width, maxH / height));
+            if (cellSize < 1) cellSize = 1;
+            if (cellSize > 15) cellSize = 15;
+            
+            let pointsStr = points.map(p => {
+                // OpenCV x is col, y is row. Our grid draws left-to-right, top-to-bottom.
+                // However, in updateHeatmap, the x index shown in UI is (width - 1 - original_x).
+                // Wait! The grid in updateHeatmap has keys: h_idx = (width - 1) - x.
+                // When we reconstructed the grid in python: 
+                // key = f"{h_idx}_{y}". grid[y, x] = dataset['pixels'][key].
+                // This means the grid array in python matches the 'x' index of the grid visually.
+                // Let's just scale by cellSize. 
+                // Since points are pixel vertices, adding 0.5 * cellSize shifts to center of pixel.
+                return `${p.x * cellSize + cellSize/2},${p.y * cellSize + cellSize/2}`;
+            }).join(' ');
+            
+            const polygon = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+            polygon.setAttribute("points", pointsStr);
+            polygon.setAttribute("fill", "none");
+            polygon.setAttribute("stroke", "#00ffff");
+            polygon.setAttribute("stroke-width", "3");
+            polygon.setAttribute("stroke-dasharray", "5 5");
+            
+            svg.appendChild(polygon);
+            
+            grid.style.position = 'relative';
+            grid.appendChild(svg);
+            currentFlakeSvg = svg;
+        }
+    } catch (e) {
+        console.error(e);
+        alert("Failed to detect flake");
+    }
+    
+    detectFlakeBtn.textContent = 'Outline Flake';
+    detectFlakeBtn.disabled = false;
 });
 
 mapTypeSelect.addEventListener('change', () => updateHeatmap())
