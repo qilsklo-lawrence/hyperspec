@@ -180,6 +180,7 @@ def update_pixel(dataset_id, pixel_key):
         if 'num_peaks' in data:
             pixel['expected_num_peaks'] = int(data['num_peaks'])
             pixel['needs_refit'] = True
+            pixel['changed'] = True
         return jsonify({"success": True})
     return jsonify({"error": "Dataset or pixel not found"}), 404
 
@@ -190,12 +191,14 @@ def reset_all_fits(dataset_id):
         
     dataset = datasets[dataset_id]
     for key, pixel in dataset['pixels'].items():
-        pixel['fit_success'] = False
-        pixel['needs_refit'] = True
-        pixel['needs_original_peaks_reset'] = True
-        pixel['fit_curves'] = []
-        pixel['total_fit_curve'] = []
-        pixel['r_squared'] = 0.0
+        if pixel.get('changed', False):
+            pixel['fit_success'] = False
+            pixel['needs_refit'] = True
+            pixel['needs_original_peaks_reset'] = True
+            pixel['changed'] = False
+            pixel['fit_curves'] = []
+            pixel['total_fit_curve'] = []
+            pixel['r_squared'] = 0.0
         
     return jsonify({"success": True})
 

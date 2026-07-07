@@ -521,7 +521,7 @@ toggleFitsBtn.addEventListener('click', () => {
 
 resetFitsBtn.addEventListener('click', async () => {
     if (!datasetSelect.value) return;
-    if (!confirm("Are you sure you want to reset all fits? This will erase all custom pixel fit parameters and refit the entire dataset to default peaks.")) return;
+    if (!confirm("Are you sure you want to reset all custom fits? This will erase custom pixel fit parameters and refit those changed pixels to default peaks.")) return;
     
     resetFitsBtn.disabled = true;
     try {
