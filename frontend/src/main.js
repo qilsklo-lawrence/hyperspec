@@ -251,6 +251,12 @@ function updateHeatmap() {
             
             if (pixelElements[key]) {
                 pixelElements[key].style.backgroundColor = `rgb(${r}, 0, ${b})`;
+                if (pixelData.changed) {
+                    pixelElements[key].style.border = '1px solid #ff8c00';
+                    pixelElements[key].style.boxSizing = 'border-box';
+                } else {
+                    pixelElements[key].style.border = 'none';
+                }
             }
         }
     }
@@ -285,7 +291,7 @@ const deleteBtn = document.getElementById('delete-btn')
 
 async function loadDatasets(selectId = null) {
     try {
-        const res = await fetch('/datasets')
+        const res = await fetch(`/datasets?t=${Date.now()}`)
         const data = await res.json()
         datasetSelect.innerHTML = ''
         if (data.datasets.length === 0) {
@@ -477,10 +483,12 @@ fitBtn.addEventListener('click', async () => {
                 precomputedData.pixels[data.key].fit_curves = data.fit_curves;
                 precomputedData.pixels[data.key].total_fit_curve = data.total_fit_curve;
                 precomputedData.pixels[data.key].r_squared = data.r_squared;
+                precomputedData.pixels[data.key].changed = true;
                 
                 // Flash animation for the pixel
                 const pixelEl = pixelElements[data.key];
                 if (pixelEl) {
+                    pixelEl.style.border = '1px solid #ff8c00';
                     const oldBg = pixelEl.style.backgroundColor;
                     pixelEl.style.backgroundColor = 'white';
                     setTimeout(() => { pixelEl.style.backgroundColor = oldBg; }, 100);
@@ -492,7 +500,7 @@ fitBtn.addEventListener('click', async () => {
                 const x = width - 1 - parseInt(parts[0]);
                 const y = parseInt(parts[1]);
                 if (currentX === x && currentY === y) {
-                    updateChart(x, y, precomputedData.pixels[data.key]);
+                    updateChart(precomputedData.pixels[data.key], x, y);
                 }
             }
         }
@@ -521,20 +529,18 @@ toggleFitsBtn.addEventListener('click', () => {
 
 resetFitsBtn.addEventListener('click', async () => {
     if (!datasetSelect.value) return;
-    if (!confirm("Are you sure you want to reset changed pixels to default peaks? You will need to click 'Fit!' again to re-run the fitting algorithm.")) return;
     
     resetFitsBtn.disabled = true;
     try {
         const res = await fetch(`/reset_all_fits/${datasetSelect.value}`, { method: 'POST' });
         if (res.ok) {
-            // Re-fetch the dataset to clear the frontend cache
-            await loadDatasets(datasetSelect.value);
+            // Re-fetch the dataset with cache-busting to clear the frontend cache
+            await initGrid(datasetSelect.value);
         } else {
-            alert("Failed to reset fits.");
+            console.error("Failed to reset fits.");
         }
     } catch (e) {
-        console.error(e);
-        alert("Error resetting fits.");
+        console.error("Error resetting fits.", e);
     }
     resetFitsBtn.disabled = false;
 });
@@ -741,11 +747,18 @@ function updateChart(data, x, y, forceRelayout) {
             let val = parseInt(numPeaksInput.value);
             if (!isNaN(val) && val > 0) {
                 data.expected_num_peaks = val;
+                data.changed = true;
                 numPeaksVal.textContent = val;
                 
                 const width = precomputedData.global_axes.width;
                 const h_idx = (width - 1) - x;
                 const key = `${h_idx}_${y}`;
+                
+                if (pixelElements[key]) {
+                    pixelElements[key].style.border = '1px solid #ff8c00';
+                    pixelElements[key].style.boxSizing = 'border-box';
+                }
+                
                 await fetch(`/update_pixel/${datasetSelect.value}/${key}`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
