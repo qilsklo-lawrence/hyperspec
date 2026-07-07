@@ -232,7 +232,10 @@ def detect_flake(dataset_id):
             h_idx = (width - 1) - x
             key = f"{h_idx}_{y}"
             if key in dataset['pixels']:
-                grid[y, x] = dataset['pixels'][key].get(map_type, 0.0)
+                val = dataset['pixels'][key].get(map_type)
+                if val is None:
+                    val = 0.0
+                grid[y, x] = float(val)
                 valid_pixels += 1
                 
     if valid_pixels == 0:
@@ -245,7 +248,7 @@ def detect_flake(dataset_id):
     else:
         grid_norm = np.zeros_like(grid, dtype=np.uint8)
         
-    blurred = cv2.GaussianBlur(grid_norm, (5, 5), 1.0)
+    blurred = cv2.GaussianBlur(grid_norm, (0, 0), 1.0)
     
     # Otsu's thresholding
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -279,7 +282,7 @@ def detect_flake(dataset_id):
                 best_contour = cnt
                 
     if best_contour is None:
-        return jsonify({"error": "Shape not found"}), 404
+        return jsonify({"error": "Shape not found. Try switching to a different Map Type."}), 404
         
     # Simplify contour for frontend rendering
     epsilon = 0.01 * cv2.arcLength(best_contour, True)
@@ -290,7 +293,34 @@ def detect_flake(dataset_id):
         x, y = pt[0]
         points.append({"x": int(x), "y": int(y)})
         
-    return jsonify({"points": points})
+    # Calculate average spectrum for the flake
+    flake_mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.drawContours(flake_mask, [best_contour], -1, 255, -1)
+    
+    specs = []
+    for y in range(height):
+        for x in range(width):
+            if flake_mask[y, x] == 255:
+                h_idx = (width - 1) - x
+                key = f"{h_idx}_{y}"
+                if key in dataset['pixels']:
+                    spec = dataset['pixels'][key].get('norm_spec')
+                    if spec is not None:
+                        specs.append(spec)
+                        
+    if len(specs) > 0:
+        specs_arr = np.array(specs)
+        mean_spec = np.mean(specs_arr, axis=0).tolist()
+        std_spec = np.std(specs_arr, axis=0).tolist()
+    else:
+        mean_spec = []
+        std_spec = []
+        
+    return jsonify({
+        "points": points,
+        "mean_spec": mean_spec,
+        "std_spec": std_spec
+    })
 
 @app.route('/rename/<dataset_id>', methods=['POST'])
 def rename_dataset(dataset_id):

@@ -66,7 +66,11 @@ document.querySelector('#app').innerHTML = `
                   <option value="wls">Wavelength (nm)</option>
               </select>
           </div>
-          <button id="reset-zoom-btn" style="padding: 5px 10px; background: #444; border: none; color: white; cursor: pointer; border-radius: 3px;">Reset Axes View</button>
+          <div style="display: flex; gap: 5px; align-items: center;">
+              <button id="show-flake-avg-btn" style="padding: 5px 10px; background: #8a2be2; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Show Flake Avg</button>
+              <button id="export-chart-btn" style="padding: 5px 10px; background: #009933; border: none; color: white; cursor: pointer; border-radius: 3px;">Export Chart PNG</button>
+              <button id="reset-zoom-btn" style="padding: 5px 10px; background: #444; border: none; color: white; cursor: pointer; border-radius: 3px;">Reset Axes View</button>
+          </div>
       </div>
       <div id="chart" style="flex: 1; width: 100%; min-height: 0;"></div>
       <div id="stats-table" class="stats-table">
@@ -117,6 +121,8 @@ const renameBtn = document.getElementById('rename-btn')
 const toggleFitsBtn = document.getElementById('toggle-fits-btn')
 const exportPngBtn = document.getElementById('export-png-btn')
 const detectFlakeBtn = document.getElementById('detect-flake-btn')
+const showFlakeAvgBtn = document.getElementById('show-flake-avg-btn')
+const exportChartBtn = document.getElementById('export-chart-btn')
 const mapTypeSelect = document.getElementById('map-type-select')
 const contrastMin = document.getElementById('contrast-min')
 const contrastMax = document.getElementById('contrast-max')
@@ -155,7 +161,94 @@ exportPngBtn.addEventListener('click', () => {
     a.click();
 });
 
+exportChartBtn.addEventListener('click', () => {
+    Plotly.downloadImage('chart', {
+        format: 'png',
+        filename: `spectrum_chart_${datasetSelect.value}`,
+        width: 800,
+        height: 600
+    });
+});
+
 let currentFlakeSvg = null;
+let flakeAvgData = null;
+
+showFlakeAvgBtn.addEventListener('click', () => {
+    if (!flakeAvgData || !flakeAvgData.mean || flakeAvgData.mean.length === 0) return;
+    
+    isLocked = true;
+    currentX = -1;
+    currentY = -1;
+    coordText.innerText = `(LOCKED) Flake Average Spectrum`;
+    
+    const xAxisData = currentUnit === 'rs' ? precomputedData.global_axes.rs : precomputedData.global_axes.wls;
+    const xTitle = currentUnit === 'rs' ? 'Raman Shift (cm⁻¹)' : 'Wavelength (nm)';
+    
+    const mean = flakeAvgData.mean;
+    const std = flakeAvgData.std;
+    
+    const upper = mean.map((val, i) => val + std[i]);
+    const lower = mean.map((val, i) => val - std[i]);
+    
+    const traces = [
+        {
+            x: xAxisData,
+            y: mean,
+            mode: 'lines',
+            type: 'scatter',
+            name: 'Flake Mean',
+            line: { color: 'rgba(31, 119, 180, 1)' }
+        },
+        {
+            x: xAxisData,
+            y: upper,
+            mode: 'lines',
+            type: 'scatter',
+            name: '+1 Std Dev',
+            line: { width: 0 },
+            showlegend: false
+        },
+        {
+            x: xAxisData,
+            y: lower,
+            mode: 'lines',
+            type: 'scatter',
+            name: '-1 Std Dev',
+            fill: 'tonexty',
+            fillcolor: 'rgba(31, 119, 180, 0.2)',
+            line: { width: 0 },
+            showlegend: false
+        }
+    ];
+    
+    const layout = {
+        title: `Flake Average Spectrum`,
+        uirevision: Math.random(), 
+        paper_bgcolor: '#1e1e1e',
+        plot_bgcolor: '#252525',
+        font: { color: '#e0e0e0' },
+        xaxis: { 
+            title: xTitle,
+            gridcolor: '#444'
+        },
+        yaxis: { 
+            title: 'Normalized Intensity (a.u.)',
+            gridcolor: '#444'
+        },
+        legend: { x: 1, xanchor: 'right', y: 1 },
+        margin: { l: 50, r: 20, t: 40, b: 40 }
+    };
+    
+    document.getElementById('stats-table').innerHTML = `
+        <div class="stats-box" style="width: 100%;">
+            <b>Flake Average</b><br>
+            Showing average spectrum over the detected flake contour with ±1 standard deviation shaded.<br>
+            <i style="color: #888; font-size: 11px;">You can export this plot using the Export Chart PNG button.</i>
+        </div>
+    `;
+    
+    Plotly.react('chart', traces, layout, {responsive: true});
+});
 
 detectFlakeBtn.addEventListener('click', async () => {
     if (!datasetSelect.value) return;
@@ -219,6 +312,17 @@ detectFlakeBtn.addEventListener('click', async () => {
             grid.style.position = 'relative';
             grid.appendChild(svg);
             currentFlakeSvg = svg;
+            
+            if (data.mean_spec && data.mean_spec.length > 0) {
+                flakeAvgData = {
+                    mean: data.mean_spec,
+                    std: data.std_spec
+                };
+                showFlakeAvgBtn.style.display = 'inline-block';
+            } else {
+                flakeAvgData = null;
+                showFlakeAvgBtn.style.display = 'none';
+            }
         }
     } catch (e) {
         console.error(e);
@@ -634,6 +738,12 @@ async function initGrid(datasetId) {
     currentX = -1
     currentY = -1
     pixelElements = {};
+    flakeAvgData = null;
+    showFlakeAvgBtn.style.display = 'none';
+    if (currentFlakeSvg) {
+        currentFlakeSvg.remove();
+        currentFlakeSvg = null;
+    }
     
     try {
         const response = await fetch(`/api/data/${datasetId}`)
