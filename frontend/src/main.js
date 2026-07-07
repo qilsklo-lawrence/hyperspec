@@ -17,6 +17,7 @@ document.querySelector('#app').innerHTML = `
               <input type="file" id="file-upload" accept=".h5,.mat" style="display: none;" />
               <button id="upload-btn" style="padding: 5px 10px; background: #4d4dff; border: none; color: white; cursor: pointer; border-radius: 3px; flex: 1;">Upload Data</button>
               <button id="fit-btn" style="padding: 5px 10px; background: #ff4d4d; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Fit!</button>
+              <button id="reset-fits-btn" style="padding: 5px 10px; background: #ff8c00; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Reset Fits</button>
               <button id="toggle-fits-btn" style="padding: 5px 10px; background: #888; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Hide Fits</button>
               <button id="export-png-btn" style="padding: 5px 10px; background: #009933; border: none; color: white; cursor: pointer; border-radius: 3px;">Export PNG</button>
           </div>
@@ -106,6 +107,7 @@ const coordText = document.getElementById('coord-text')
 const datasetSelect = document.getElementById('dataset-select')
 const uploadBtn = document.getElementById('upload-btn')
 const fitBtn = document.getElementById('fit-btn')
+const resetFitsBtn = document.getElementById('reset-fits-btn')
 const fileUpload = document.getElementById('file-upload')
 const uploadStatus = document.getElementById('upload-status')
 const unitSelect = document.getElementById('unit-select')
@@ -517,6 +519,29 @@ toggleFitsBtn.addEventListener('click', () => {
     }
 });
 
+resetFitsBtn.addEventListener('click', async () => {
+    if (!datasetSelect.value) return;
+    if (!confirm("Are you sure you want to reset all fits? This will erase all custom pixel fit parameters and refit the entire dataset to default peaks.")) return;
+    
+    resetFitsBtn.disabled = true;
+    try {
+        const res = await fetch(`/reset_all_fits/${datasetSelect.value}`, { method: 'POST' });
+        if (res.ok) {
+            // Re-fetch the dataset to clear the frontend cache
+            await loadDatasets(datasetSelect.value);
+            // Optionally auto-trigger the fit button here, or let the user do it
+            // fitBtn.click();
+            alert("Fits have been reset. Click 'Fit!' to re-run the fitting algorithm on the default peaks.");
+        } else {
+            alert("Failed to reset fits.");
+        }
+    } catch (e) {
+        console.error(e);
+        alert("Error resetting fits.");
+    }
+    resetFitsBtn.disabled = false;
+});
+
 async function initGrid(datasetId) {
     grid.innerHTML = '<div style="color: #ccc; padding: 20px;">Downloading data payload...</div>'
     precomputedData = null
@@ -604,6 +629,7 @@ async function initGrid(datasetId) {
         
         updateHeatmap();
         fitBtn.style.display = 'inline-block';
+        resetFitsBtn.style.display = 'inline-block';
         toggleFitsBtn.style.display = 'inline-block';
         
         resetZoomBtn.onclick = () => {
@@ -616,6 +642,7 @@ async function initGrid(datasetId) {
         console.error("Failed to load data:", e)
         grid.innerHTML = '<div style="color: #ff4d4d; padding: 20px;">Failed to load dataset.</div>'
         fitBtn.style.display = 'none';
+        resetFitsBtn.style.display = 'none';
         toggleFitsBtn.style.display = 'none';
     }
 }

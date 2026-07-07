@@ -183,6 +183,22 @@ def update_pixel(dataset_id, pixel_key):
         return jsonify({"success": True})
     return jsonify({"error": "Dataset or pixel not found"}), 404
 
+@app.route('/reset_all_fits/<dataset_id>', methods=['POST'])
+def reset_all_fits(dataset_id):
+    if dataset_id not in datasets:
+        return jsonify({"error": "Dataset not found"}), 404
+        
+    dataset = datasets[dataset_id]
+    for key, pixel in dataset['pixels'].items():
+        pixel['fit_success'] = False
+        pixel['needs_refit'] = True
+        pixel['needs_original_peaks_reset'] = True
+        pixel['fit_curves'] = []
+        pixel['total_fit_curve'] = []
+        pixel['r_squared'] = 0.0
+        
+    return jsonify({"success": True})
+
 @app.route('/rename/<dataset_id>', methods=['POST'])
 def rename_dataset(dataset_id):
     data = request.json
