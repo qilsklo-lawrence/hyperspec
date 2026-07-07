@@ -8,7 +8,7 @@ import uuid
 import hashlib
 from werkzeug.utils import secure_filename
 from flask import Flask, jsonify, send_from_directory, request, Response
-from precompute import process_h5
+from precompute import process_h5, recommend_peak_count
 from fit import perform_fits
 
 app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
@@ -190,15 +190,20 @@ def reset_all_fits(dataset_id):
         return jsonify({"error": "Dataset not found"}), 404
         
     dataset = datasets[dataset_id]
+    rs = dataset['global_axes']['rs']
     for key, pixel in dataset['pixels'].items():
         if pixel.get('changed', False):
             pixel['fit_success'] = False
             pixel['needs_refit'] = True
-            pixel['needs_original_peaks_reset'] = True
             pixel['changed'] = False
+            pixel.pop('expected_num_peaks', None)
             pixel['fit_curves'] = []
             pixel['total_fit_curve'] = []
             pixel['r_squared'] = 0.0
+            
+            n_peaks, p_indices = recommend_peak_count(rs, pixel['norm_spec'])
+            pixel['num_peaks'] = n_peaks
+            pixel['peak_indices'] = p_indices
         
     return jsonify({"success": True})
 

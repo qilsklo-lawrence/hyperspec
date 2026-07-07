@@ -36,15 +36,6 @@ def perform_fits(dataset_id, datasets):
             continue
             
         pixel['needs_refit'] = False
-        if pixel.get('needs_original_peaks_reset'):
-            pixel['needs_original_peaks_reset'] = False
-            pixel.pop('expected_num_peaks', None)
-            from precompute import recommend_peak_count
-            norm_spec_arr = np.array(pixel['norm_spec'])
-            n_peaks, p_indices = recommend_peak_count(x_data, norm_spec_arr)
-            pixel['num_peaks'] = n_peaks
-            pixel['peak_indices'] = p_indices
-            
         if 'expected_num_peaks' in pixel:
             target_n = pixel['expected_num_peaks']
             norm_spec_arr = np.array(pixel['norm_spec'])

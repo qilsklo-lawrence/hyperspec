@@ -521,7 +521,7 @@ toggleFitsBtn.addEventListener('click', () => {
 
 resetFitsBtn.addEventListener('click', async () => {
     if (!datasetSelect.value) return;
-    if (!confirm("Are you sure you want to reset all custom fits? This will erase custom pixel fit parameters and refit those changed pixels to default peaks.")) return;
+    if (!confirm("Are you sure you want to reset changed pixels to default peaks? You will need to click 'Fit!' again to re-run the fitting algorithm.")) return;
     
     resetFitsBtn.disabled = true;
     try {
@@ -529,9 +529,6 @@ resetFitsBtn.addEventListener('click', async () => {
         if (res.ok) {
             // Re-fetch the dataset to clear the frontend cache
             await loadDatasets(datasetSelect.value);
-            // Optionally auto-trigger the fit button here, or let the user do it
-            // fitBtn.click();
-            alert("Fits have been reset. Click 'Fit!' to re-run the fitting algorithm on the default peaks.");
         } else {
             alert("Failed to reset fits.");
         }
