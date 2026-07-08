@@ -1,0 +1,30 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches:
+      - main  # or master, depending on your default branch name
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate with Google Cloud
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+
+      # Deploy to Cloud Run using the source code directly
+      # (This automatically triggers Cloud Build using our Dockerfile)
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: hyperspec-app
+          region: us-central1
+          source: .
+          flags: '--memory=2Gi --allow-unauthenticated'
