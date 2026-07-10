@@ -45,4 +45,4 @@ jobs:
           service: hyperspec-app
           region: us-central1
           image: gcr.io/${{ steps.auth.outputs.project_id }}/hyperspec-app:${{ github.sha }}
-          flags: '--memory=2Gi --allow-unauthenticated'
+          flags: '--memory=2Gi --allow-unauthenticated --service-account=hyperspec-runtime@mf-crucible.iam.gserviceaccount.com'

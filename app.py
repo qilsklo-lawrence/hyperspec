@@ -10,6 +10,10 @@ from werkzeug.utils import secure_filename
 from flask import Flask, jsonify, send_from_directory, request, Response
 from precompute import process_h5, recommend_peak_count
 from fit import perform_fits
+import datetime
+from google.cloud import storage
+
+BUCKET_NAME = 'app-hyperspec'
 
 app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
 
@@ -111,19 +115,44 @@ def process_file_background(filepath, dataset_id, filename):
         processing_status[dataset_id] = {'status': 'error', 'error': str(e)}
 
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    file = request.files['file']
+@app.route('/generate_upload_url', methods=['POST'])
+def generate_upload_url():
+    data = request.json
+    filename = data.get('filename', 'upload.h5')
+    filename = secure_filename(filename)
+    object_name = f"{uuid.uuid4()}_{filename}"
     
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-    if file and (file.filename.endswith('.h5') or file.filename.endswith('.mat')):
-        filename = secure_filename(file.filename)
-        temp_id = str(uuid.uuid4())
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{temp_id}_{filename}")
-        file.save(filepath)
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob = bucket.blob(object_name)
+        
+        url = blob.generate_signed_url(
+            version="v4",
+            expiration=datetime.timedelta(minutes=15),
+            method="PUT",
+            content_type="application/octet-stream",
+        )
+        return jsonify({"signed_url": url, "object_name": object_name, "filename": filename})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/process_gcs_file', methods=['POST'])
+def process_gcs_file():
+    data = request.json
+    object_name = data.get('object_name')
+    filename = data.get('filename')
+    
+    if not object_name or not filename:
+        return jsonify({"error": "Missing object_name or filename"}), 400
+        
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob = bucket.blob(object_name)
+        
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(object_name))
+        blob.download_to_filename(filepath)
         
         file_hash = get_file_hash(filepath)
         dataset_id = file_hash[:8]
@@ -146,12 +175,13 @@ def upload_file():
         thread.start()
         
         return jsonify({
-            "message": "File upload started",
+            "message": "File processing started",
             "dataset_id": dataset_id,
             "filename": filename,
             "duplicate": False
         })
-    return jsonify({"error": "Invalid file type. Only .h5 or .mat allowed."}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/status/<dataset_id>')
 def get_status(dataset_id):

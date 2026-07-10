@@ -565,19 +565,41 @@ fileUpload.addEventListener('change', async (e) => {
     uploadBtn.textContent = 'Uploading...'
     uploadBtn.disabled = true
     
-    const formData = new FormData()
-    formData.append('file', file)
-    
     try {
-        const res = await fetch('/upload', { method: 'POST', body: formData })
-        const data = await res.json()
-        if (!res.ok) throw new Error(data.error || "Upload failed")
+        // Step 1: Generate Signed URL
+        const genRes = await fetch('/generate_upload_url', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: file.name })
+        });
+        const genData = await genRes.json();
+        if (!genRes.ok) throw new Error(genData.error || "Failed to generate upload URL");
+        
+        // Step 2: Upload to GCS
+        uploadStatus.innerText = 'Uploading to Cloud Storage...';
+        const uploadRes = await fetch(genData.signed_url, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: file
+        });
+        if (!uploadRes.ok) throw new Error("Cloud Storage upload failed");
+        
+        // Step 3: Tell backend to process it
+        uploadStatus.innerText = 'Processing file...';
+        const procRes = await fetch('/process_gcs_file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ object_name: genData.object_name, filename: genData.filename })
+        });
+        const data = await procRes.json();
+        if (!procRes.ok) throw new Error(data.error || "Processing failed");
+        
         if (data.duplicate) {
-            alert(data.message)
-            await loadDatasets(data.dataset_id)
-            finishUpload()
+            alert(data.message);
+            await loadDatasets(data.dataset_id);
+            finishUpload();
         } else {
-            pollStatus(data.dataset_id)
+            pollStatus(data.dataset_id);
         }
     } catch (err) {
         alert(err.message)

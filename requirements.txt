@@ -5,3 +5,4 @@ scipy
 Werkzeug
 waitress
 opencv-python-headless
+google-cloud-storage
