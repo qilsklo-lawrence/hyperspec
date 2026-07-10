@@ -6,3 +6,4 @@ __pycache__/
 .git/
 .env
 uploads/
+mf-crucible*.json
