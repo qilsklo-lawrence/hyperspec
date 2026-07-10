@@ -364,7 +364,9 @@ def get_dataset(dataset_id):
     # Wait for the dataset to finish background processing/loading
     for _ in range(600): # up to 60 seconds
         if dataset_id in datasets:
-            return jsonify(datasets[dataset_id])
+            def generate():
+                yield json.dumps(datasets[dataset_id])
+            return Response(generate(), mimetype='application/json')
         if dataset_id in processing_status and processing_status[dataset_id].get('status') == 'error':
             return jsonify({"error": processing_status[dataset_id].get('error')}), 500
         time.sleep(0.1)
