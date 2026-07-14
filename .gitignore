@@ -13,3 +13,5 @@ reset_script.py
 frontend/dist/
 node_modules/
 mf-crucible*.json
+venv/
+scripts/__pycache__/

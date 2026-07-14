@@ -1,4 +1,5 @@
 import os
+import glob
 import h5py
 import numpy as np
 import time
@@ -23,6 +24,14 @@ dataset_names = {}
 processing_status = {}  # Store background task status
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Local development: use the service-account key kept next to this file for
+# GCS access. The key is dockerignored, so this never triggers on Cloud Run,
+# which authenticates through its runtime service account instead.
+if 'GOOGLE_APPLICATION_CREDENTIALS' not in os.environ:
+    _local_keys = glob.glob(os.path.join(BASE_DIR, 'mf-crucible*.json'))
+    if _local_keys:
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = _local_keys[0]
 default_data_path = os.path.join(BASE_DIR, 'precomputed_data.json')
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -115,24 +124,55 @@ def process_file_background(filepath, dataset_id, filename):
         processing_status[dataset_id] = {'status': 'error', 'error': str(e)}
 
 
+def generate_signed_put_url(blob):
+    """
+    Sign a V4 PUT URL for the blob.
+
+    In production (Cloud Run) the default credentials are token-only — there is
+    no private key on the box — so signing MUST go through the IAM SignBlob API.
+    This requires the runtime service account to have
+    roles/iam.serviceAccountTokenCreator on itself.
+
+    In local development, credentials from a service-account JSON key
+    (GOOGLE_APPLICATION_CREDENTIALS) carry a private key and can sign directly.
+    """
+    import google.auth
+    from google.auth import credentials as gauth_credentials
+    from google.auth.transport import requests as gauth_requests
+
+    kwargs = dict(
+        version="v4",
+        expiration=datetime.timedelta(minutes=15),
+        method="PUT",
+        content_type="application/octet-stream",
+    )
+
+    credentials, _ = google.auth.default()
+    if isinstance(credentials, gauth_credentials.Signing):
+        # Local development: key-based credentials sign directly
+        return blob.generate_signed_url(**kwargs)
+
+    # Production path: token-only credentials, sign via IAM SignBlob
+    credentials.refresh(gauth_requests.Request())
+    return blob.generate_signed_url(
+        **kwargs,
+        service_account_email=credentials.service_account_email,
+        access_token=credentials.token,
+    )
+
 @app.route('/generate_upload_url', methods=['POST'])
 def generate_upload_url():
     data = request.json
     filename = data.get('filename', 'upload.h5')
     filename = secure_filename(filename)
     object_name = f"{uuid.uuid4()}_{filename}"
-    
+
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(object_name)
-        
-        url = blob.generate_signed_url(
-            version="v4",
-            expiration=datetime.timedelta(minutes=15),
-            method="PUT",
-            content_type="application/octet-stream",
-        )
+
+        url = generate_signed_put_url(blob)
         return jsonify({"signed_url": url, "object_name": object_name, "filename": filename})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

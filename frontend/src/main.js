@@ -1043,4 +1043,64 @@ function updateChart(data, x, y, forceRelayout) {
 }
 
 // Start app
-loadDatasets()
+// Supports deep-linking from external tools (e.g. EDS Data Explorer):
+//   ?dataset=<id>                      select a dataset already known to this instance
+//   ?object=<gcs_object>&filename=<n>  fallback so the link survives Cloud Run scaling:
+//                                      if this instance doesn't know the dataset, it
+//                                      re-downloads the file from the GCS bucket and
+//                                      processes it (content-hash dedup keeps this cheap)
+async function startApp() {
+    const params = new URLSearchParams(window.location.search)
+    const requestedId = params.get('dataset')
+    const objectName = params.get('object')
+    const filename = params.get('filename')
+
+    if (!requestedId && !(objectName && filename)) {
+        loadDatasets()
+        return
+    }
+
+    if (requestedId) {
+        try {
+            const res = await fetch(`/status/${requestedId}`)
+            const data = await res.json()
+            if (data.status === 'done') {
+                await loadDatasets(requestedId)
+                return
+            }
+            if (data.status === 'processing') {
+                await loadDatasets(requestedId)
+                pollStatus(requestedId)
+                return
+            }
+        } catch (e) {
+            console.error(e)
+        }
+    }
+
+    // Dataset unknown to this instance: rebuild it from the GCS object if provided
+    await loadDatasets()
+    if (objectName && filename) {
+        uploadStatus.innerText = 'Fetching dataset...'
+        try {
+            const res = await fetch('/process_gcs_file', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ object_name: objectName, filename: filename })
+            })
+            const data = await res.json()
+            if (!res.ok) throw new Error(data.error || 'Failed to fetch dataset')
+            if (data.duplicate) {
+                uploadStatus.innerText = ''
+                await loadDatasets(data.dataset_id)
+            } else {
+                pollStatus(data.dataset_id)
+            }
+        } catch (e) {
+            uploadStatus.innerText = e.message
+        }
+    } else {
+        uploadStatus.innerText = `Dataset ${requestedId} not found`
+    }
+}
+startApp()
