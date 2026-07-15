@@ -1,27 +1,30 @@
 import os
 import glob
-import h5py
-import numpy as np
-import time
-import json
-import threading
-import uuid
 import hashlib
+import json
+import secrets as pysecrets
+import threading
+import time
+import uuid
+import urllib.request
+from collections import OrderedDict
+from datetime import timedelta
+
+import numpy as np
 from werkzeug.utils import secure_filename
-from flask import Flask, jsonify, send_from_directory, request, Response
+from flask import Flask, jsonify, request, Response, redirect, session
+from google.cloud import storage
+from itsdangerous import BadSignature, SignatureExpired
+
+import auth
 from precompute import process_h5, recommend_peak_count
 from fit import perform_fits
-import datetime
-from google.cloud import storage
 
-BUCKET_NAME = 'app-hyperspec'
+BUCKET_NAME = os.environ.get('BUCKET_NAME', 'app-hyperspec')
+CRUCIBLE_EXPLORE_URL = os.environ.get('CRUCIBLE_EXPLORE_URL', '').rstrip('/')
+HYPERSPEC_SSO_SECRET = os.environ.get('HYPERSPEC_SSO_SECRET', '')
 
 app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
-
-datasets = {}
-file_hashes = {}
-dataset_names = {}
-processing_status = {}  # Store background task status
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -32,97 +35,450 @@ if 'GOOGLE_APPLICATION_CREDENTIALS' not in os.environ:
     _local_keys = glob.glob(os.path.join(BASE_DIR, 'mf-crucible*.json'))
     if _local_keys:
         os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = _local_keys[0]
+
+# ── Sessions ──────────────────────────────────────────────────────────────────
+# The signed session cookie is the only carrier of identity. All Hyperspec
+# containers must share SECRET_KEY (Secret Manager) so a session minted by one
+# instance/revision is valid on every other one.
+_secret = os.environ.get('SECRET_KEY')
+if not _secret:
+    print("WARNING: SECRET_KEY not set — using a random per-boot key; "
+          "sessions will not survive restarts or span multiple containers.")
+    _secret = pysecrets.token_hex(32)
+app.secret_key = _secret
+app.config.update(
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_HTTPONLY=True,
+    # K_SERVICE is set by Cloud Run; local http dev keeps non-Secure cookies
+    SESSION_COOKIE_SECURE=bool(os.environ.get('K_SERVICE')),
+)
+
+_sso_serializer = auth.make_serializer(HYPERSPEC_SSO_SECRET) if HYPERSPEC_SSO_SECRET else None
+
 default_data_path = os.path.join(BASE_DIR, 'precomputed_data.json')
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-NAMES_DB = os.path.join(UPLOAD_FOLDER, 'dataset_names.json')
+# ── In-memory state ───────────────────────────────────────────────────────────
+# Working copies of datasets, keyed by (principal, dataset_id). Every request
+# resolves its principal from the session, so one user's edits (pixel peak
+# overrides, fits, ...) can never be observed through another principal's key.
+datasets = {}
+processing_status = {}   # (principal, dataset_id) -> status dict
 
-def save_names_db():
-    with open(NAMES_DB, 'w') as f:
-        json.dump(dataset_names, f)
+# Pristine (never-mutated) precompute results, content-addressed by sha256 and
+# kept as JSON *text* so handing a copy to a principal always deserializes into
+# an independent object. Small LRU; GCS/local disk back it (see _pristine_*).
+_pristine_text: OrderedDict = OrderedDict()
+_PRISTINE_MEM_MAX = 8
 
-def load_names_db():
-    global dataset_names
-    if os.path.exists(NAMES_DB):
-        with open(NAMES_DB, 'r') as f:
-            dataset_names = json.load(f)
-
-load_names_db()
-
+DEFAULT_NAME = 'default (MAPPING.h5)'
+default_dataset = None
 if os.path.exists(default_data_path):
     try:
         with open(default_data_path, 'r') as f:
-            datasets['default'] = json.load(f)
-            if 'default' not in dataset_names:
-                dataset_names['default'] = 'default (MAPPING.h5)'
+            default_dataset = json.load(f)
     except json.JSONDecodeError:
-        print("Warning: precomputed_data.json is corrupted or is a Git LFS pointer file. Default dataset will not be loaded.")
+        print("Warning: precomputed_data.json is corrupted or is a Git LFS pointer file. "
+              "Default dataset will not be loaded.")
 
-def get_file_hash(filepath):
+
+# ── GCS helpers (best-effort: local dev without credentials degrades) ────────
+_storage_client = None
+
+
+def _bucket():
+    global _storage_client
+    if _storage_client is None:
+        _storage_client = storage.Client()
+    return _storage_client.bucket(BUCKET_NAME)
+
+
+def _gcs_read_text(path):
+    try:
+        return _bucket().blob(path).download_as_bytes().decode('utf-8')
+    except Exception:
+        return None
+
+
+def _gcs_write_text(path, text):
+    try:
+        _bucket().blob(path).upload_from_string(text, content_type='application/json')
+        return True
+    except Exception as e:
+        print(f"GCS write failed for {path}: {e}")
+        return False
+
+
+def _gcs_read_json(path):
+    text = _gcs_read_text(path)
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _gcs_write_json(path, obj):
+    return _gcs_write_text(path, json.dumps(obj, separators=(',', ':')))
+
+
+def _gcs_delete(path):
+    try:
+        _bucket().blob(path).delete()
+    except Exception:
+        pass
+
+
+# ── Per-principal storage layout ──────────────────────────────────────────────
+# ORCiD users (durable, shared by every Hyperspec container):
+#   gs://<bucket>/users/<orcid>/registry.json           {id: {name, sha256}}
+#   gs://<bucket>/users/<orcid>/datasets/<id>.json      mutated working copies
+# Shared content-addressed caches (pristine only, never mutated):
+#   gs://<bucket>/cache/precomputed/<sha256>.json
+#   gs://<bucket>/cache/raw/<sha256>/<filename>
+# Anonymous users: registry lives in the session cookie; working copies in
+# memory + this container's disk (ephemeral by design).
+
+def _registry_path(orcid):
+    return f'users/{orcid}/registry.json'
+
+
+def _workcopy_path(orcid, dsid):
+    return f'users/{orcid}/datasets/{dsid}.json'
+
+
+def _cache_json_path(sha):
+    return f'cache/precomputed/{sha}.json'
+
+
+def _cache_raw_path(sha, filename):
+    return f'cache/raw/{sha}/{filename}'
+
+
+def _pid_token(principal):
+    """Opaque, deterministic per-principal prefix for temp upload objects."""
+    return hashlib.sha1(principal.encode()).hexdigest()[:16]
+
+
+def _anon_work_path(principal, dsid):
+    d = os.path.join(UPLOAD_FOLDER, 'anon_work', _pid_token(principal))
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f'{dsid}.json')
+
+
+def _local_cache_path(sha):
+    d = os.path.join(UPLOAD_FOLDER, 'cache')
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f'{sha}.json')
+
+
+# ── Registry: which dataset ids a principal may touch ─────────────────────────
+
+def registry_get(principal):
+    if auth.is_orcid(principal):
+        return _gcs_read_json(_registry_path(auth.orcid_of(principal))) or {}
+    return session.get('registry') or {}
+
+
+def registry_put(principal, dsid, name, sha):
+    entry = {'name': name, 'sha256': sha}
+    if auth.is_orcid(principal):
+        orcid = auth.orcid_of(principal)
+        reg = _gcs_read_json(_registry_path(orcid)) or {}
+        reg[dsid] = entry
+        _gcs_write_json(_registry_path(orcid), reg)
+    else:
+        reg = session.get('registry') or {}
+        reg[dsid] = entry
+        session['registry'] = reg
+        session.modified = True
+
+
+def registry_remove(principal, dsid):
+    if auth.is_orcid(principal):
+        orcid = auth.orcid_of(principal)
+        reg = _gcs_read_json(_registry_path(orcid)) or {}
+        if dsid in reg:
+            del reg[dsid]
+            _gcs_write_json(_registry_path(orcid), reg)
+    else:
+        reg = session.get('registry') or {}
+        if dsid in reg:
+            del reg[dsid]
+            session['registry'] = reg
+            session.modified = True
+
+
+# ── Pristine content cache ────────────────────────────────────────────────────
+
+def _pristine_load(sha):
+    """Pristine precompute JSON text for a content hash, or None."""
+    if not sha:
+        return None
+    if sha in _pristine_text:
+        _pristine_text.move_to_end(sha)
+        return _pristine_text[sha]
+    text = None
+    local = _local_cache_path(sha)
+    if os.path.exists(local):
+        with open(local, 'r') as f:
+            text = f.read()
+    if text is None:
+        text = _gcs_read_text(_cache_json_path(sha))
+        if text is not None:
+            with open(local, 'w') as f:
+                f.write(text)
+    if text is not None:
+        _pristine_text[sha] = text
+        while len(_pristine_text) > _PRISTINE_MEM_MAX:
+            _pristine_text.popitem(last=False)
+    return text
+
+
+def _pristine_store(sha, text):
+    _pristine_text[sha] = text
+    while len(_pristine_text) > _PRISTINE_MEM_MAX:
+        _pristine_text.popitem(last=False)
+    with open(_local_cache_path(sha), 'w') as f:
+        f.write(text)
+    _gcs_write_text(_cache_json_path(sha), text)
+
+
+# ── Working-copy access ───────────────────────────────────────────────────────
+
+def load_working(principal, dsid):
+    """Return the dataset visible to `principal` under `dsid`, or None.
+
+    Resolution order: in-memory working copy → persisted working copy
+    (GCS for orcid, local disk for anon) → pristine content cache (via the
+    sha recorded in the principal's registry). The shared demo `default` is
+    readable by everyone; reads get the shared object, writes go through
+    ensure_writable() which makes a private copy first.
+    """
+    key = (principal, dsid)
+    if key in datasets:
+        return datasets[key]
+
+    if dsid == 'default':
+        if auth.is_orcid(principal):
+            data = _gcs_read_json(_workcopy_path(auth.orcid_of(principal), 'default'))
+            if data is not None:
+                datasets[key] = data
+                return data
+        return default_dataset
+
+    entry = registry_get(principal).get(dsid)
+    if not entry:
+        return None
+
+    if auth.is_orcid(principal):
+        data = _gcs_read_json(_workcopy_path(auth.orcid_of(principal), dsid))
+        if data is not None:
+            datasets[key] = data
+            return data
+    else:
+        local = _anon_work_path(principal, dsid)
+        if os.path.exists(local):
+            with open(local, 'r') as f:
+                data = json.load(f)
+            datasets[key] = data
+            return data
+
+    text = _pristine_load(entry.get('sha256'))
+    if text is not None:
+        data = json.loads(text)
+        datasets[key] = data
+        return data
+    return None
+
+
+def ensure_writable(principal, dsid):
+    """Like load_working, but guarantees a private mutable copy (copy-on-write
+    for the shared default demo)."""
+    data = load_working(principal, dsid)
+    if data is None:
+        return None
+    key = (principal, dsid)
+    if key not in datasets:
+        # Shared/default object — never mutate it; clone into the namespace
+        datasets[key] = json.loads(json.dumps(data))
+    return datasets[key]
+
+
+def flush_working(principal, dsid):
+    """Persist the principal's working copy (GCS for orcid, disk for anon)."""
+    data = datasets.get((principal, dsid))
+    if data is None:
+        return
+    text = json.dumps(data, separators=(',', ':'))
+    if auth.is_orcid(principal):
+        _gcs_write_text(_workcopy_path(auth.orcid_of(principal), dsid), text)
+    else:
+        with open(_anon_work_path(principal, dsid), 'w') as f:
+            f.write(text)
+
+
+# ── Ingestion pipeline ────────────────────────────────────────────────────────
+
+def _sha256_file(filepath):
     h = hashlib.sha256()
     with open(filepath, 'rb') as f:
         while chunk := f.read(8192):
             h.update(chunk)
     return h.hexdigest()
 
-def load_single_dataset_from_file(filepath, filename):
-    file_hash = get_file_hash(filepath)
-    dataset_id = file_hash[:8]
-    
-    file_hashes[file_hash] = dataset_id
-    if dataset_id not in dataset_names:
-        dataset_names[dataset_id] = filename
-        save_names_db()
-    
-    json_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{dataset_id}.json")
-    if os.path.exists(json_filepath):
-        print(f"Loading cached fits for {dataset_id} in background...")
-        processing_status[dataset_id] = {'status': 'processing', 'current': 0, 'total': 1, 'message': 'Loading from disk...'}
-        try:
-            with open(json_filepath, 'r') as f:
-                datasets[dataset_id] = json.load(f)
-            processing_status[dataset_id] = {'status': 'done', 'dataset_id': dataset_id}
-        except Exception as e:
-            print(f"Failed to load cached {dataset_id}: {e}")
-            processing_status[dataset_id] = {'status': 'error', 'error': str(e)}
-    else:
-        print(f"Precomputing fits for new file {filename} in background...")
-        process_file_background(filepath, dataset_id, filename)
 
-def load_persisted_datasets_bg():
-    print("Scanning uploads directory for datasets in background...")
-    for filename in os.listdir(UPLOAD_FOLDER):
-        if filename.endswith('.h5') or filename.endswith('.mat'):
-            filepath = os.path.join(UPLOAD_FOLDER, filename)
-            threading.Thread(target=load_single_dataset_from_file, args=(filepath, filename), daemon=True).start()
+def _cache_raw_store(filepath, sha, filename):
+    """Best-effort: keep the raw bytes content-addressed in GCS so identical
+    future imports never re-transfer them."""
+    try:
+        blob = _bucket().blob(_cache_raw_path(sha, filename))
+        if not blob.exists():
+            blob.upload_from_filename(filepath)
+    except Exception as e:
+        print(f"raw cache store failed for {sha}: {e}")
 
-# Launch in background so server startup is extremely fast
-threading.Thread(target=load_persisted_datasets_bg, daemon=True).start()
-save_names_db()
 
-def process_file_background(filepath, dataset_id, filename):
-    processing_status[dataset_id] = {'status': 'processing', 'current': 0, 'total': 1, 'message': 'Initializing...'}
+def process_file_background(principal, filepath, dsid, sha, filename):
+    key = (principal, dsid)
+    processing_status[key] = {'status': 'processing', 'current': 0, 'total': 1,
+                              'message': 'Initializing...'}
+
     def update_progress(current, total, message):
-        processing_status[dataset_id] = {'status': 'processing', 'current': current, 'total': total, 'message': message}
-    
+        processing_status[key] = {'status': 'processing', 'current': current,
+                                  'total': total, 'message': message}
+
     try:
         data = process_h5(filepath, progress_callback=update_progress)
-        datasets[dataset_id] = data
-        dataset_names[dataset_id] = filename
-        save_names_db()
-        
-        json_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{dataset_id}.json")
-        with open(json_filepath, 'w') as f:
-            json.dump(data, f, separators=(',', ':'))
-            
-        processing_status[dataset_id] = {'status': 'done', 'dataset_id': dataset_id}
+        # Store the pristine result first — dedupe for everyone — then hand
+        # this principal their own working copy.
+        _pristine_store(sha, json.dumps(data, separators=(',', ':')))
+        datasets[key] = data
+        processing_status[key] = {'status': 'done', 'dataset_id': dsid}
     except Exception as e:
+        registry_remove_safe = auth.is_orcid(principal)
+        if registry_remove_safe:
+            # anon registries live in the cookie and can't be edited here;
+            # their stale entry just 404s later.
+            registry_remove(principal, dsid)
+        processing_status[key] = {'status': 'error', 'error': str(e)}
+    finally:
         if os.path.exists(filepath):
             os.remove(filepath)
-        processing_status[dataset_id] = {'status': 'error', 'error': str(e)}
 
+
+def ingest_local_file(principal, filepath, filename):
+    """Hash, register, and process a file for a principal.
+
+    Returns (dataset_id, duplicate). Must run inside a request context (it
+    may write the anon registry into the session cookie).
+    """
+    sha = _sha256_file(filepath)
+    dsid = sha[:8]
+    key = (principal, dsid)
+
+    reg = registry_get(principal)
+    duplicate = dsid in reg
+    if not duplicate:
+        registry_put(principal, dsid, filename, sha)
+
+    if duplicate and (key in datasets or load_working(principal, dsid) is not None):
+        os.remove(filepath)
+        return dsid, True
+
+    text = _pristine_load(sha)
+    if text is not None:
+        # Someone (possibly this user, possibly not) already paid for the
+        # precompute of these exact bytes — reuse the result, own copy.
+        datasets[key] = json.loads(text)
+        processing_status[key] = {'status': 'done', 'dataset_id': dsid}
+        os.remove(filepath)
+        return dsid, duplicate
+
+    _cache_raw_store(filepath, sha, filename)
+    threading.Thread(target=process_file_background,
+                     args=(principal, filepath, dsid, sha, filename),
+                     daemon=True).start()
+    return dsid, duplicate
+
+
+# ── Crucible SSO / import ─────────────────────────────────────────────────────
+
+@app.route('/import')
+def import_from_crucible():
+    """Entry point for Crucible-signed tokens.
+
+    Identity (ORCiD) and the object to ingest come exclusively from the
+    verified token — never from other request parameters.
+    """
+    if _sso_serializer is None:
+        return "Crucible integration is not configured on this Hyperspec instance.", 503
+    token = request.args.get('token', '')
+    try:
+        payload = auth.verify_import_token(_sso_serializer, token)
+    except SignatureExpired:
+        return ("This Crucible link has expired — go back to Crucible and click "
+                "\"Open in Hyperspec\" again."), 403
+    except BadSignature:
+        return "Invalid Crucible token.", 403
+
+    auth.login_orcid(payload['orcid'], payload.get('name'))
+    principal = f"orcid:{payload['orcid']}"
+
+    object_name = payload.get('object')
+    signed_url = payload.get('signed_url')
+    if not object_name and not signed_url:
+        return redirect('/')  # login-only bounce
+
+    filename = secure_filename(payload.get('filename') or 'import.h5')
+    local = os.path.join(UPLOAD_FOLDER, f'import_{uuid.uuid4().hex}_{filename}')
+    try:
+        if object_name:
+            # Crucible only ever writes under incoming/ (write-only IAM grant)
+            if not object_name.startswith('incoming/'):
+                return "Invalid import object.", 400
+            _bucket().blob(object_name).download_to_filename(local)
+        else:
+            if not signed_url.startswith('https://'):
+                return "Invalid import URL.", 400
+            with urllib.request.urlopen(signed_url) as resp, open(local, 'wb') as out:
+                while chunk := resp.read(1024 * 1024):
+                    out.write(chunk)
+    except Exception as e:
+        if os.path.exists(local):
+            os.remove(local)
+        return f"Could not fetch the file from Crucible: {e}", 502
+
+    dsid, _ = ingest_local_file(principal, local, filename)
+    if object_name:
+        _gcs_delete(object_name)
+    return redirect(f'/?dataset={dsid}')
+
+
+@app.route('/config')
+def client_config():
+    principal = auth.get_principal()
+    identity = {'type': 'orcid' if auth.is_orcid(principal) else 'anon'}
+    if auth.is_orcid(principal):
+        identity['orcid'] = auth.orcid_of(principal)
+        identity['name'] = session.get('display_name') or identity['orcid']
+    return jsonify({
+        'identity': identity,
+        'sign_in_url': f'{CRUCIBLE_EXPLORE_URL}/hyperspec/sso' if CRUCIBLE_EXPLORE_URL else None,
+    })
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({'success': True})
+
+
+# ── Upload flow (browser → signed PUT → process) ─────────────────────────────
 
 def generate_signed_put_url(blob):
     """
@@ -136,6 +492,7 @@ def generate_signed_put_url(blob):
     In local development, credentials from a service-account JSON key
     (GOOGLE_APPLICATION_CREDENTIALS) carry a private key and can sign directly.
     """
+    import datetime
     import google.auth
     from google.auth import credentials as gauth_credentials
     from google.auth.transport import requests as gauth_requests
@@ -160,93 +517,93 @@ def generate_signed_put_url(blob):
         access_token=credentials.token,
     )
 
+
 @app.route('/generate_upload_url', methods=['POST'])
 def generate_upload_url():
+    principal = auth.get_principal()
     data = request.json
-    filename = data.get('filename', 'upload.h5')
-    filename = secure_filename(filename)
-    object_name = f"{uuid.uuid4()}_{filename}"
+    filename = secure_filename(data.get('filename', 'upload.h5'))
+    # Prefix-locked per principal: /process_gcs_file only accepts objects here
+    object_name = f"uploads-tmp/{_pid_token(principal)}/{uuid.uuid4()}_{filename}"
 
     try:
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
-        blob = bucket.blob(object_name)
-
+        blob = _bucket().blob(object_name)
         url = generate_signed_put_url(blob)
         return jsonify({"signed_url": url, "object_name": object_name, "filename": filename})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/process_gcs_file', methods=['POST'])
 def process_gcs_file():
+    principal = auth.get_principal()
     data = request.json
     object_name = data.get('object_name')
     filename = data.get('filename')
-    
+
     if not object_name or not filename:
         return jsonify({"error": "Missing object_name or filename"}), 400
-        
+    # A principal may only process objects it was issued an upload URL for
+    if not object_name.startswith(f"uploads-tmp/{_pid_token(principal)}/"):
+        return jsonify({"error": "Object does not belong to this session"}), 403
+
+    filename = secure_filename(filename)
+    local = os.path.join(UPLOAD_FOLDER, f'upload_{uuid.uuid4().hex}_{filename}')
     try:
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
-        blob = bucket.blob(object_name)
-        
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(object_name))
-        blob.download_to_filename(filepath)
-        
-        file_hash = get_file_hash(filepath)
-        dataset_id = file_hash[:8]
-        
-        if dataset_id in datasets:
-            os.remove(filepath)
-            original_name = dataset_names.get(dataset_id, dataset_id)
+        _bucket().blob(object_name).download_to_filename(local)
+        dsid, duplicate = ingest_local_file(principal, local, filename)
+        _gcs_delete(object_name)
+        if duplicate:
+            name = registry_get(principal).get(dsid, {}).get('name', dsid)
             return jsonify({
-                "message": f"Dataset already exists as '{original_name}'.",
-                "dataset_id": dataset_id,
+                "message": f"Dataset already exists as '{name}'.",
+                "dataset_id": dsid,
                 "filename": filename,
                 "duplicate": True
             })
-            
-        new_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{dataset_id}_{filename}")
-        os.rename(filepath, new_filepath)
-        file_hashes[file_hash] = dataset_id
-        
-        thread = threading.Thread(target=process_file_background, args=(new_filepath, dataset_id, filename))
-        thread.start()
-        
         return jsonify({
             "message": "File processing started",
-            "dataset_id": dataset_id,
+            "dataset_id": dsid,
             "filename": filename,
             "duplicate": False
         })
     except Exception as e:
+        if os.path.exists(local):
+            os.remove(local)
         return jsonify({"error": str(e)}), 500
+
+
+# ── Dataset routes (all scoped to the session principal) ─────────────────────
 
 @app.route('/status/<dataset_id>')
 def get_status(dataset_id):
-    if dataset_id in processing_status:
-        return jsonify(processing_status[dataset_id])
-    if dataset_id in datasets:
+    principal = auth.get_principal()
+    key = (principal, dataset_id)
+    if key in processing_status:
+        return jsonify(processing_status[key])
+    if load_working(principal, dataset_id) is not None:
         return jsonify({'status': 'done', 'dataset_id': dataset_id})
     return jsonify({'status': 'not_found'}), 404
 
+
 @app.route('/datasets')
 def list_datasets():
+    principal = auth.get_principal()
     res = []
-    # Return all datasets known by name, even if they are still loading in background
-    for d_id in dataset_names.keys():
-        res.append({
-            "id": d_id,
-            "name": dataset_names.get(d_id, d_id)
-        })
+    if default_dataset is not None:
+        res.append({"id": "default", "name": DEFAULT_NAME})
+    for dsid, entry in registry_get(principal).items():
+        res.append({"id": dsid, "name": entry.get('name', dsid)})
     return jsonify({"datasets": res})
+
 
 @app.route('/update_pixel/<dataset_id>/<pixel_key>', methods=['POST'])
 def update_pixel(dataset_id, pixel_key):
+    principal = auth.get_principal()
     data = request.json
-    if dataset_id in datasets and pixel_key in datasets[dataset_id]['pixels']:
-        pixel = datasets[dataset_id]['pixels'][pixel_key]
+    dataset = ensure_writable(principal, dataset_id)
+    if dataset is not None and pixel_key in dataset['pixels']:
+        pixel = dataset['pixels'][pixel_key]
         if 'num_peaks' in data:
             pixel['expected_num_peaks'] = int(data['num_peaks'])
             pixel['needs_refit'] = True
@@ -254,12 +611,14 @@ def update_pixel(dataset_id, pixel_key):
         return jsonify({"success": True})
     return jsonify({"error": "Dataset or pixel not found"}), 404
 
+
 @app.route('/reset_all_fits/<dataset_id>', methods=['POST'])
 def reset_all_fits(dataset_id):
-    if dataset_id not in datasets:
+    principal = auth.get_principal()
+    dataset = ensure_writable(principal, dataset_id)
+    if dataset is None:
         return jsonify({"error": "Dataset not found"}), 404
-        
-    dataset = datasets[dataset_id]
+
     rs = dataset['global_axes']['rs']
     for key, pixel in dataset['pixels'].items():
         if pixel.get('changed', False):
@@ -270,30 +629,31 @@ def reset_all_fits(dataset_id):
             pixel['fit_curves'] = []
             pixel['total_fit_curve'] = []
             pixel['r_squared'] = 0.0
-            
+
             n_peaks, p_indices = recommend_peak_count(rs, pixel['norm_spec'])
             pixel['num_peaks'] = n_peaks
             pixel['peak_indices'] = p_indices
-        
+
     return jsonify({"success": True})
+
 
 @app.route('/detect_flake/<dataset_id>', methods=['GET'])
 def detect_flake(dataset_id):
-    if dataset_id not in datasets:
+    principal = auth.get_principal()
+    dataset = load_working(principal, dataset_id)
+    if dataset is None:
         return jsonify({"error": "Dataset not found"}), 404
-        
+
     try:
         import cv2
-        import numpy as np
     except ImportError:
         return jsonify({"error": "OpenCV not installed on server"}), 500
-        
+
     map_type = request.args.get('map_type', 'integrated_intensity')
-    dataset = datasets[dataset_id]
-    
+
     width = dataset['global_axes']['width']
     height = dataset['global_axes']['height']
-    
+
     # Reconstruct the 2D grid
     grid = np.zeros((height, width), dtype=np.float32)
     valid_pixels = 0
@@ -307,66 +667,66 @@ def detect_flake(dataset_id):
                     val = 0.0
                 grid[y, x] = float(val)
                 valid_pixels += 1
-                
+
     if valid_pixels == 0:
         return jsonify({"error": "No valid data"}), 400
-        
+
     min_val = np.min(grid)
     max_val = np.max(grid)
     if max_val > min_val:
         grid_norm = np.uint8(255 * (grid - min_val) / (max_val - min_val))
     else:
         grid_norm = np.zeros_like(grid, dtype=np.uint8)
-        
+
     blurred = cv2.GaussianBlur(grid_norm, (0, 0), 1.0)
-    
+
     # Otsu's thresholding
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
+
     # Morphological Cleanup
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
     cleaned = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
-    
+
     contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
+
     best_contour = None
     best_area = 0
     total_area = width * height
-    
+
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area < total_area * 0.02:
             continue
-            
+
         hull = cv2.convexHull(cnt)
         hull_area = cv2.contourArea(hull)
         if hull_area == 0:
             continue
-            
+
         solidity = area / hull_area
-        
+
         if solidity > 0.5:
             if area > best_area:
                 best_area = area
                 best_contour = cnt
-                
+
     if best_contour is None:
         return jsonify({"error": "Shape not found. Try switching to a different Map Type."}), 404
-        
+
     # Simplify contour for frontend rendering
     epsilon = 0.01 * cv2.arcLength(best_contour, True)
     approx = cv2.approxPolyDP(best_contour, epsilon, True)
-    
+
     points = []
     for pt in approx:
         x, y = pt[0]
         points.append({"x": int(x), "y": int(y)})
-        
+
     # Calculate average spectrum for the flake
     flake_mask = np.zeros((height, width), dtype=np.uint8)
     cv2.drawContours(flake_mask, [best_contour], -1, 255, -1)
-    
+
     specs = []
     for y in range(height):
         for x in range(width):
@@ -377,7 +737,7 @@ def detect_flake(dataset_id):
                     spec = dataset['pixels'][key].get('norm_spec')
                     if spec is not None:
                         specs.append(spec)
-                        
+
     if len(specs) > 0:
         specs_arr = np.array(specs)
         mean_spec = np.mean(specs_arr, axis=0).tolist()
@@ -385,92 +745,106 @@ def detect_flake(dataset_id):
     else:
         mean_spec = []
         std_spec = []
-        
+
     return jsonify({
         "points": points,
         "mean_spec": mean_spec,
         "std_spec": std_spec
     })
 
+
 @app.route('/rename/<dataset_id>', methods=['POST'])
 def rename_dataset(dataset_id):
+    principal = auth.get_principal()
     data = request.json
     if not data or 'name' not in data:
         return jsonify({"error": "No name provided"}), 400
-    if dataset_id in dataset_names or dataset_id in datasets:
-        dataset_names[dataset_id] = data['name']
-        save_names_db()
-        return jsonify({"success": True, "name": data['name']})
-    return jsonify({"error": "Dataset not found"}), 404
+    if dataset_id == 'default':
+        return jsonify({"error": "Cannot rename default dataset"}), 403
+    reg = registry_get(principal)
+    if dataset_id not in reg:
+        return jsonify({"error": "Dataset not found"}), 404
+    registry_put(principal, dataset_id, data['name'], reg[dataset_id].get('sha256'))
+    return jsonify({"success": True, "name": data['name']})
+
 
 @app.route('/dataset/<dataset_id>', methods=['DELETE'])
 def delete_dataset(dataset_id):
+    principal = auth.get_principal()
     if dataset_id == 'default':
         return jsonify({"error": "Cannot delete default dataset"}), 403
-    
-    if dataset_id in datasets:
-        del datasets[dataset_id]
-        if dataset_id in dataset_names:
-            del dataset_names[dataset_id]
-            save_names_db()
-            
-        # Remove from disk
-        json_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{dataset_id}.json")
-        if os.path.exists(json_path):
-            os.remove(json_path)
-            
-        # Try to find and remove the h5/mat file
-        for filename in os.listdir(app.config['UPLOAD_FOLDER']):
-            if filename.startswith(f"{dataset_id}_") and (filename.endswith('.h5') or filename.endswith('.mat')):
-                h5_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                if os.path.exists(h5_path):
-                    os.remove(h5_path)
-                    
-        return jsonify({"success": True})
-    return jsonify({"error": "Dataset not found"}), 404
+
+    reg = registry_get(principal)
+    if dataset_id not in reg:
+        return jsonify({"error": "Dataset not found"}), 404
+
+    registry_remove(principal, dataset_id)
+    datasets.pop((principal, dataset_id), None)
+    processing_status.pop((principal, dataset_id), None)
+    if auth.is_orcid(principal):
+        _gcs_delete(_workcopy_path(auth.orcid_of(principal), dataset_id))
+    else:
+        local = _anon_work_path(principal, dataset_id)
+        if os.path.exists(local):
+            os.remove(local)
+    # The shared content cache (cache/…) is intentionally kept: it holds only
+    # pristine derived data, and other principals may reference the same hash.
+    return jsonify({"success": True})
+
 
 @app.route('/api/data/<dataset_id>')
 def get_dataset(dataset_id):
+    principal = auth.get_principal()
     # Wait for the dataset to finish background processing/loading
-    for _ in range(600): # up to 60 seconds
-        if dataset_id in datasets:
-            def generate():
-                yield json.dumps(datasets[dataset_id])
-            return Response(generate(), mimetype='application/json')
-        if dataset_id in processing_status and processing_status[dataset_id].get('status') == 'error':
-            return jsonify({"error": processing_status[dataset_id].get('error')}), 500
+    for _ in range(600):  # up to 60 seconds
+        data = load_working(principal, dataset_id)
+        if data is not None:
+            payload = json.dumps(data)
+            return Response(payload, mimetype='application/json')
+        status = processing_status.get((principal, dataset_id))
+        if status is not None and status.get('status') == 'error':
+            return jsonify({"error": status.get('error')}), 500
+        if status is None:
+            break  # not this principal's dataset — don't hold the connection
         time.sleep(0.1)
     return jsonify({"error": "Dataset not found or still loading"}), 404
 
+
 @app.route('/fit_stream/<dataset_id>')
 def fit_stream(dataset_id):
+    # Resolve principal and working copy NOW — the generator below runs while
+    # streaming, outside the request context, and must not touch the session.
+    principal = auth.get_principal()
+    dataset = ensure_writable(principal, dataset_id)
+
     def generate():
         # Using SSE to stream fit results
+        if dataset is None:
+            yield f"data: {json.dumps({'error': 'Dataset not found'})}\n\n"
+            return
         try:
-            for result in perform_fits(dataset_id, datasets):
+            for result in perform_fits(dataset_id, {dataset_id: dataset}):
                 yield f"data: {json.dumps(result)}\n\n"
-            
-            # Flush to disk exactly once at the end
-            if dataset_id in datasets:
-                json_filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{dataset_id}.json")
-                if dataset_id == 'default':
-                    json_filepath = default_data_path
-                with open(json_filepath, 'w') as f:
-                    json.dump(datasets[dataset_id], f, separators=(',', ':'))
-                    
+
+            # Persist the principal's working copy exactly once at the end
+            flush_working(principal, dataset_id)
+
             yield "data: {\"done\": true}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return Response(generate(), mimetype='text/event-stream')
 
+
 @app.route('/')
 def serve_index():
     return app.send_static_file('index.html')
 
+
 @app.route('/<path:path>')
 def serve_static(path):
     return app.send_static_file(path)
+
 
 if __name__ == '__main__':
     print("Starting server...")

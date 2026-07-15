@@ -4,7 +4,8 @@ import Plotly from 'plotly.js-dist-min'
 document.querySelector('#app').innerHTML = `
   <div class="left-panel">
       <h2>Hyperspectral Map Grid</h2>
-      
+      <div id="identity-bar" style="margin-bottom: 8px; font-size: 12px; color: #aaa; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;"></div>
+
       <div style="margin-bottom: 10px; display: flex; flex-direction: column; gap: 5px; width: 100%;">
           <div style="display: flex; gap: 5px; width: 100%;">
               <select id="dataset-select" style="padding: 5px; background: #333; color: white; border: 1px solid #555; flex: 1;">
@@ -1042,65 +1043,77 @@ function updateChart(data, x, y, forceRelayout) {
     Plotly.react('chart', traces, layout, {responsive: true});
 }
 
+// Identity badge: who this session is (Crucible ORCiD or anonymous).
+// Identity is decided server-side from the signed session cookie — this is
+// purely informational UI.
+async function loadIdentity() {
+    const bar = document.getElementById('identity-bar')
+    try {
+        const res = await fetch('/config')
+        const cfg = await res.json()
+        bar.innerHTML = ''
+        const label = document.createElement('span')
+        if (cfg.identity && cfg.identity.type === 'orcid') {
+            label.textContent = `Signed in via Crucible: ${cfg.identity.name || cfg.identity.orcid} (${cfg.identity.orcid})`
+            label.style.color = '#8fbf6f'
+            bar.appendChild(label)
+            const out = document.createElement('a')
+            out.textContent = 'Sign out'
+            out.href = '#'
+            out.style.color = '#888'
+            out.addEventListener('click', async (e) => {
+                e.preventDefault()
+                await fetch('/logout', { method: 'POST' })
+                window.location.href = '/'
+            })
+            bar.appendChild(out)
+        } else {
+            label.textContent = 'Anonymous session — your uploads are private to this browser'
+            bar.appendChild(label)
+            if (cfg.sign_in_url) {
+                const a = document.createElement('a')
+                a.textContent = 'Sign in via Crucible'
+                a.href = cfg.sign_in_url
+                a.style.color = '#7fb3ff'
+                bar.appendChild(a)
+            }
+        }
+    } catch (e) {
+        console.error(e)
+    }
+}
+
 // Start app
-// Supports deep-linking from external tools (e.g. EDS Data Explorer):
-//   ?dataset=<id>                      select a dataset already known to this instance
-//   ?object=<gcs_object>&filename=<n>  fallback so the link survives Cloud Run scaling:
-//                                      if this instance doesn't know the dataset, it
-//                                      re-downloads the file from the GCS bucket and
-//                                      processes it (content-hash dedup keeps this cheap)
+// Supports deep-linking (?dataset=<id>), e.g. the redirect after a
+// Crucible-signed /import. Datasets only appear if they belong to this
+// session's principal — there is no way to pull arbitrary GCS objects.
 async function startApp() {
+    loadIdentity()
     const params = new URLSearchParams(window.location.search)
     const requestedId = params.get('dataset')
-    const objectName = params.get('object')
-    const filename = params.get('filename')
 
-    if (!requestedId && !(objectName && filename)) {
+    if (!requestedId) {
         loadDatasets()
         return
     }
 
-    if (requestedId) {
-        try {
-            const res = await fetch(`/status/${requestedId}`)
-            const data = await res.json()
-            if (data.status === 'done') {
-                await loadDatasets(requestedId)
-                return
-            }
-            if (data.status === 'processing') {
-                await loadDatasets(requestedId)
-                pollStatus(requestedId)
-                return
-            }
-        } catch (e) {
-            console.error(e)
+    try {
+        const res = await fetch(`/status/${requestedId}`)
+        const data = await res.json()
+        if (data.status === 'done') {
+            await loadDatasets(requestedId)
+            return
         }
+        if (data.status === 'processing') {
+            await loadDatasets(requestedId)
+            pollStatus(requestedId)
+            return
+        }
+    } catch (e) {
+        console.error(e)
     }
 
-    // Dataset unknown to this instance: rebuild it from the GCS object if provided
     await loadDatasets()
-    if (objectName && filename) {
-        uploadStatus.innerText = 'Fetching dataset...'
-        try {
-            const res = await fetch('/process_gcs_file', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ object_name: objectName, filename: filename })
-            })
-            const data = await res.json()
-            if (!res.ok) throw new Error(data.error || 'Failed to fetch dataset')
-            if (data.duplicate) {
-                uploadStatus.innerText = ''
-                await loadDatasets(data.dataset_id)
-            } else {
-                pollStatus(data.dataset_id)
-            }
-        } catch (e) {
-            uploadStatus.innerText = e.message
-        }
-    } else {
-        uploadStatus.innerText = `Dataset ${requestedId} not found`
-    }
+    uploadStatus.innerText = `Dataset ${requestedId} not found`
 }
 startApp()
