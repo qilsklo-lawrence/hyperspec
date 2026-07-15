@@ -800,7 +800,14 @@ def get_dataset(dataset_id):
         data = load_working(principal, dataset_id)
         if data is not None:
             payload = json.dumps(data)
-            return Response(payload, mimetype='application/json')
+
+            # Stream in chunks: Cloud Run caps non-chunked responses at 32 MiB
+            # and large datasets (e.g. the 88 MB default) exceed that.
+            def generate(text=payload):
+                for i in range(0, len(text), 4 * 1024 * 1024):
+                    yield text[i:i + 4 * 1024 * 1024]
+
+            return Response(generate(), mimetype='application/json')
         status = processing_status.get((principal, dataset_id))
         if status is not None and status.get('status') == 'error':
             return jsonify({"error": status.get('error')}), 500
