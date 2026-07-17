@@ -396,6 +396,48 @@ def logout():
 
 # ── Upload flow (browser → signed PUT → process) ─────────────────────────────
 
+def _ingest_response(principal, local, filename):
+    """Shared tail of every upload route: ingest and describe the outcome."""
+    dsid, duplicate = ingest_local_file(principal, local, filename)
+    if duplicate:
+        name = registry_get(principal).get(dsid, {}).get('name', dsid)
+        return jsonify({
+            "message": f"Dataset already exists as '{name}'.",
+            "dataset_id": dsid,
+            "filename": filename,
+            "duplicate": True
+        })
+    return jsonify({
+        "message": "File processing started",
+        "dataset_id": dsid,
+        "filename": filename,
+        "duplicate": False
+    })
+
+
+@app.route('/upload_direct', methods=['POST'])
+def upload_direct():
+    """Direct multipart upload, used by the local dev frontend.
+
+    The production flow goes browser → GCS signed PUT → /process_gcs_file
+    because Cloud Run caps request bodies at 32 MiB; locally that hop only
+    adds cloud-credential and bucket-CORS failure modes, so the dev build
+    posts the file straight here instead.
+    """
+    principal = auth.get_principal()
+    f = request.files.get('file')
+    if f is None:
+        return jsonify({"error": "No file provided"}), 400
+    filename = secure_filename(f.filename or 'upload.h5')
+    local = os.path.join(UPLOAD_FOLDER, f'upload_{uuid.uuid4().hex}_{filename}')
+    try:
+        f.save(local)
+        return _ingest_response(principal, local, filename)
+    except Exception as e:
+        if os.path.exists(local):
+            os.remove(local)
+        return jsonify({"error": str(e)}), 500
+
 def generate_signed_put_url(blob):
     """
     Sign a V4 PUT URL for the blob.
@@ -467,22 +509,9 @@ def process_gcs_file():
     local = os.path.join(UPLOAD_FOLDER, f'upload_{uuid.uuid4().hex}_{filename}')
     try:
         _bucket().blob(object_name).download_to_filename(local)
-        dsid, duplicate = ingest_local_file(principal, local, filename)
+        response = _ingest_response(principal, local, filename)
         _gcs_delete(object_name)
-        if duplicate:
-            name = registry_get(principal).get(dsid, {}).get('name', dsid)
-            return jsonify({
-                "message": f"Dataset already exists as '{name}'.",
-                "dataset_id": dsid,
-                "filename": filename,
-                "duplicate": True
-            })
-        return jsonify({
-            "message": "File processing started",
-            "dataset_id": dsid,
-            "filename": filename,
-            "duplicate": False
-        })
+        return response
     except Exception as e:
         if os.path.exists(local):
             os.remove(local)

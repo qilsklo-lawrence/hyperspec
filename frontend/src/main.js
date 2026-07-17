@@ -840,34 +840,47 @@ fileUpload.addEventListener('change', async (e) => {
     uploadBtn.disabled = true
     
     try {
-        // Step 1: Generate Signed URL
-        const genRes = await fetch('/generate_upload_url', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ filename: file.name })
-        });
-        const genData = await genRes.json();
-        if (!genRes.ok) throw new Error(genData.error || "Failed to generate upload URL");
-        
-        // Step 2: Upload to GCS
-        uploadStatus.innerText = 'Uploading to Cloud Storage...';
-        const uploadRes = await fetch(genData.signed_url, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/octet-stream' },
-            body: file
-        });
-        if (!uploadRes.ok) throw new Error("Cloud Storage upload failed");
-        
-        // Step 3: Tell backend to process it
-        uploadStatus.innerText = 'Processing file...';
-        const procRes = await fetch('/process_gcs_file', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ object_name: genData.object_name, filename: genData.filename })
-        });
-        const data = await procRes.json();
-        if (!procRes.ok) throw new Error(data.error || "Processing failed");
-        
+        let data;
+        if (import.meta.env.DEV) {
+            // Dev server (`npm run dev`): post straight to the local Flask
+            // backend via the Vite proxy — the signed-URL hop below would
+            // need cloud credentials and bucket CORS for localhost.
+            uploadStatus.innerText = 'Uploading to local server...';
+            const form = new FormData();
+            form.append('file', file, file.name);
+            const res = await fetch('/upload_direct', { method: 'POST', body: form });
+            data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Upload failed");
+        } else {
+            // Step 1: Generate Signed URL
+            const genRes = await fetch('/generate_upload_url', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: file.name })
+            });
+            const genData = await genRes.json();
+            if (!genRes.ok) throw new Error(genData.error || "Failed to generate upload URL");
+
+            // Step 2: Upload to GCS
+            uploadStatus.innerText = 'Uploading to Cloud Storage...';
+            const uploadRes = await fetch(genData.signed_url, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/octet-stream' },
+                body: file
+            });
+            if (!uploadRes.ok) throw new Error("Cloud Storage upload failed");
+
+            // Step 3: Tell backend to process it
+            uploadStatus.innerText = 'Processing file...';
+            const procRes = await fetch('/process_gcs_file', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ object_name: genData.object_name, filename: genData.filename })
+            });
+            data = await procRes.json();
+            if (!procRes.ok) throw new Error(data.error || "Processing failed");
+        }
+
         if (data.duplicate) {
             alert(data.message);
             await loadDatasets(data.dataset_id);
