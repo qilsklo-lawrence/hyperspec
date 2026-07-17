@@ -823,6 +823,7 @@ def fit_stream(dataset_id):
     # streaming, outside the request context, and must not touch the session.
     principal = auth.get_principal()
     dataset = ensure_writable(principal, dataset_id)
+    fit_mode = request.args.get('mode', 'pseudo_voigt')
 
     def generate():
         # Using SSE to stream fit results
@@ -830,7 +831,7 @@ def fit_stream(dataset_id):
             yield f"data: {json.dumps({'error': 'Dataset not found'})}\n\n"
             return
         try:
-            for result in perform_fits(dataset_id, {dataset_id: dataset}):
+            for result in perform_fits(dataset_id, {dataset_id: dataset}, mode=fit_mode):
                 yield f"data: {json.dumps(result)}\n\n"
 
             # Persist the principal's working copy exactly once at the end

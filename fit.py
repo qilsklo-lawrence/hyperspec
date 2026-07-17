@@ -11,19 +11,30 @@ def pseudo_voigt(x, a, c, w, eta):
     G = np.exp(-4 * np.log(2) * (x - c)**2 / w**2)
     return a * (eta * L + (1 - eta) * G)
 
-def multi_pv(x, *params):
-    b0 = params[0]
-    b1 = params[1]
-    
-    y = b0 + b1 * x
-    for i in range(2, len(params), 4):
-        y += pseudo_voigt(x, params[i], params[i+1], params[i+2], params[i+3])
-    return y
+# Whole-image line-shape choice: eta free (pseudo-Voigt) or pinned.
+FIT_MODES = {'pseudo_voigt': None, 'lorentzian': 1.0, 'gaussian': 0.0}
 
-def perform_fits(dataset_id, datasets):
+def make_multi_peak(fixed_eta):
+    """Model with linear baseline + N peaks. Peaks carry 4 params
+    (a, c, w, eta) when eta is free, 3 (a, c, w) when it is pinned."""
+    step = 4 if fixed_eta is None else 3
+    def model(x, *params):
+        y = params[0] + params[1] * x
+        for i in range(2, len(params), step):
+            eta = params[i+3] if fixed_eta is None else fixed_eta
+            y += pseudo_voigt(x, params[i], params[i+1], params[i+2], eta)
+        return y
+    return model
+
+def perform_fits(dataset_id, datasets, mode='pseudo_voigt'):
     """
     Generator that yields JSON-serializable fit results for each pixel as they are computed.
     """
+    if mode not in FIT_MODES:
+        mode = 'pseudo_voigt'
+    fixed_eta = FIT_MODES[mode]
+    step = 4 if fixed_eta is None else 3
+    model = make_multi_peak(fixed_eta)
     if dataset_id not in datasets:
         yield {"error": "Dataset not found"}
         return
@@ -32,7 +43,8 @@ def perform_fits(dataset_id, datasets):
     x_data = np.array(dataset['global_axes']['rs'])
     
     for key, pixel in dataset['pixels'].items():
-        if pixel.get('fit_success') and not pixel.get('needs_refit', False):
+        if (pixel.get('fit_success') and not pixel.get('needs_refit', False)
+                and pixel.get('fit_mode', 'pseudo_voigt') == mode):
             continue
             
         pixel['needs_refit'] = False
@@ -79,27 +91,30 @@ def perform_fits(dataset_id, datasets):
             c_guess = x_data[idx]
             a_guess = max(0.001, norm_spec[idx] - b0_guess)
             w_guess = 20.0
-            eta_guess = 0.5
-            p0.extend([a_guess, c_guess, w_guess, eta_guess])
-            bounds_lower.extend([0, c_guess - 50, 0, 0])
-            bounds_upper.extend([np.inf, c_guess + 50, 2000, 1])
-            
+            p0.extend([a_guess, c_guess, w_guess])
+            bounds_lower.extend([0, c_guess - 50, 0])
+            bounds_upper.extend([np.inf, c_guess + 50, 2000])
+            if fixed_eta is None:
+                p0.append(0.5)
+                bounds_lower.append(0)
+                bounds_upper.append(1)
+
         try:
-            popt, _ = curve_fit(multi_pv, x_fit, y_fit, p0=p0, bounds=(bounds_lower, bounds_upper), maxfev=10000)
-            
-            total_fit = multi_pv(x_data, *popt)
+            popt, _ = curve_fit(model, x_fit, y_fit, p0=p0, bounds=(bounds_lower, bounds_upper), maxfev=10000)
+
+            total_fit = model(x_data, *popt)
             bg_fit = popt[0] + popt[1] * x_data
-            
+
             ss_res = np.sum((norm_spec - total_fit) ** 2)
             ss_tot = np.sum((norm_spec - np.mean(norm_spec)) ** 2)
             r_squared = 1 - (ss_res / ss_tot)
-            
+
             fit_curves = []
-            for i in range(2, len(popt), 4):
+            for i in range(2, len(popt), step):
                 a = popt[i]
                 c = popt[i+1]
                 w = popt[i+2]
-                eta = popt[i+3]
+                eta = popt[i+3] if fixed_eta is None else fixed_eta
                 curve = pseudo_voigt(x_data, a, c, w, eta) + bg_fit
                 fit_curves.append({
                     'a': round(float(a), 3),
@@ -112,6 +127,7 @@ def perform_fits(dataset_id, datasets):
             result = {
                 'key': key,
                 'fit_success': True,
+                'fit_mode': mode,
                 'fit_curves': fit_curves,
                 'total_fit_curve': np.round(total_fit, 3).tolist(),
                 'r_squared': float(r_squared)
@@ -120,6 +136,7 @@ def perform_fits(dataset_id, datasets):
             result = {
                 'key': key,
                 'fit_success': False,
+                'fit_mode': mode,
                 'fit_curves': [],
                 'total_fit_curve': [],
                 'r_squared': 0.0

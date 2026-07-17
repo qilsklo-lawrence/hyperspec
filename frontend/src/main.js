@@ -17,11 +17,17 @@ document.querySelector('#app').innerHTML = `
           <div style="display: flex; gap: 5px; width: 100%;">
               <input type="file" id="file-upload" accept=".h5,.mat" style="display: none;" />
               <button id="upload-btn" style="padding: 5px 10px; background: #4d4dff; border: none; color: white; cursor: pointer; border-radius: 3px; flex: 1;">Upload Data</button>
+              <select id="fit-mode-select" style="padding: 5px; background: #333; color: white; border: 1px solid #555; border-radius: 3px; display: none;" title="Line shape used for every peak in the whole image">
+                  <option value="pseudo_voigt">Pseudo-Voigt (free η)</option>
+                  <option value="lorentzian">Lorentzian (η=1)</option>
+                  <option value="gaussian">Gaussian (η=0)</option>
+              </select>
               <button id="fit-btn" style="padding: 5px 10px; background: #ff4d4d; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Fit!</button>
               <button id="reset-fits-btn" style="padding: 5px 10px; background: #ff8c00; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Reset Fits</button>
               <button id="toggle-fits-btn" style="padding: 5px 10px; background: #888; border: none; color: white; cursor: pointer; border-radius: 3px; display: none;">Hide Fits</button>
               <button id="export-png-btn" style="padding: 5px 10px; background: #009933; border: none; color: white; cursor: pointer; border-radius: 3px;">Export PNG</button>
               <button id="detect-flake-btn" style="padding: 5px 10px; background: #8a2be2; border: none; color: white; cursor: pointer; border-radius: 3px;">Outline Flake</button>
+              <button id="draw-flake-btn" style="padding: 5px 10px; background: #b8860b; border: none; color: white; cursor: pointer; border-radius: 3px;" title="Click to place polygon vertices; click the first vertex or double-click to close; Esc cancels">Draw Flake</button>
           </div>
           <div id="upload-status" style="font-size: 12px; color: #aaa; text-align: center;"></div>
       </div>
@@ -33,7 +39,17 @@ document.querySelector('#app').innerHTML = `
                   <option value="integrated_intensity">Integrated Intensity</option>
                   <option value="l_max">Max Intensity</option>
                   <option value="sharpness">Sharpness</option>
+                  <option value="peak_pos">Peak Position (fit)</option>
+                  <option value="peak_fwhm">Peak FWHM (fit)</option>
               </select>
+          </div>
+          <div id="int-range-row" style="display: flex; gap: 5px; width: 100%; align-items: center;">
+              <label style="color: #ccc; font-size: 12px; width: 80px;" title="Only spectrum values inside this x-range are summed for the Integrated Intensity map">Int. Range:</label>
+              <input type="number" id="int-range-min" placeholder="min" step="any" style="width: 70px; background: #333; color: #fff; border: 1px solid #555; padding: 2px;">
+              <span style="color: #888;">–</span>
+              <input type="number" id="int-range-max" placeholder="max" step="any" style="width: 70px; background: #333; color: #fff; border: 1px solid #555; padding: 2px;">
+              <span id="int-range-unit" style="color: #ccc; font-size: 12px;">cm⁻¹</span>
+              <button id="int-range-reset" style="padding: 2px 8px; background: #555; border: none; color: white; cursor: pointer; border-radius: 3px; font-size: 12px;">Full</button>
           </div>
           <div style="display: flex; gap: 5px; width: 100%; align-items: center;">
               <label style="color: #ccc; font-size: 12px; width: 80px;">Min %:</label>
@@ -125,6 +141,12 @@ const detectFlakeBtn = document.getElementById('detect-flake-btn')
 const showFlakeAvgBtn = document.getElementById('show-flake-avg-btn')
 const exportChartBtn = document.getElementById('export-chart-btn')
 const mapTypeSelect = document.getElementById('map-type-select')
+const fitModeSelect = document.getElementById('fit-mode-select')
+const drawFlakeBtn = document.getElementById('draw-flake-btn')
+const intRangeMin = document.getElementById('int-range-min')
+const intRangeMax = document.getElementById('int-range-max')
+const intRangeUnit = document.getElementById('int-range-unit')
+const intRangeReset = document.getElementById('int-range-reset')
 const contrastMin = document.getElementById('contrast-min')
 const contrastMax = document.getElementById('contrast-max')
 const contrastMinVal = document.getElementById('contrast-min-val')
@@ -242,10 +264,13 @@ showFlakeAvgBtn.addEventListener('click', () => {
         margin: { l: 60, r: 20, t: 40, b: 60 }
     };
     
+    const regionDesc = flakeAvgData.source === 'manual'
+        ? `the hand-drawn polygon (${flakeAvgData.n} pixels)`
+        : 'the detected flake contour';
     document.getElementById('stats-table').innerHTML = `
         <div class="stats-box" style="width: 100%;">
             <b>Flake Average</b><br>
-            Showing average spectrum over the detected flake contour with ±1 standard deviation shaded.<br>
+            Showing average spectrum over ${regionDesc} with ±1 standard deviation shaded.<br>
             <i style="color: #888; font-size: 11px;">You can export this plot using the Export Chart PNG button.</i>
         </div>
     `;
@@ -282,15 +307,10 @@ detectFlakeBtn.addEventListener('click', async () => {
             svg.style.pointerEvents = 'none';
             svg.style.zIndex = '10';
             
-            const width = precomputedData.global_axes.width || 51;
-            const height = precomputedData.global_axes.height || 51;
-            const container = document.querySelector('.left-panel');
-            const maxW = container.clientWidth - 60;
-            const maxH = window.innerHeight - 300;
-            let cellSize = Math.floor(Math.min(maxW / width, maxH / height));
-            if (cellSize < 1) cellSize = 1;
-            if (cellSize > 15) cellSize = 15;
-            
+            const cellSize = gridCellSize;
+
+            autoContourCellPts = points.map(p => ({ x: p.x + 0.5, y: p.y + 0.5 }));
+
             let pointsStr = points.map(p => {
                 // OpenCV x is col, y is row. Our grid draws left-to-right, top-to-bottom.
                 // However, in updateHeatmap, the x index shown in UI is (width - 1 - original_x).
@@ -319,7 +339,9 @@ detectFlakeBtn.addEventListener('click', async () => {
             if (data.mean_spec && data.mean_spec.length > 0) {
                 flakeAvgData = {
                     mean: data.mean_spec,
-                    std: data.std_spec
+                    std: data.std_spec,
+                    n: null,
+                    source: 'auto'
                 };
                 showFlakeAvgBtn.style.display = 'inline-block';
             } else {
@@ -334,6 +356,184 @@ detectFlakeBtn.addEventListener('click', async () => {
     
     detectFlakeBtn.textContent = 'Outline Flake';
     detectFlakeBtn.disabled = false;
+});
+
+// ---- Manual flake polygon drawing ----
+
+function makeGridOverlay() {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.style.position = 'absolute';
+    svg.style.top = '0';
+    svg.style.left = '0';
+    svg.style.width = '100%';
+    svg.style.height = '100%';
+    svg.style.pointerEvents = 'none';
+    svg.style.zIndex = '11';
+    grid.style.position = 'relative';
+    grid.appendChild(svg);
+    return svg;
+}
+
+function gridEventToCell(e) {
+    const rect = grid.getBoundingClientRect();
+    return { x: (e.clientX - rect.left) / gridCellSize, y: (e.clientY - rect.top) / gridCellSize };
+}
+
+// Snap priority: auto-detected contour vertex (trace-and-correct), then
+// pixel corner, else the raw cursor position.
+function snapCellPoint(p) {
+    if (autoContourCellPts) {
+        let best = null, bestD = 1.0;
+        for (const q of autoContourCellPts) {
+            const d = Math.hypot(p.x - q.x, p.y - q.y);
+            if (d < bestD) { bestD = d; best = q; }
+        }
+        if (best) return { x: best.x, y: best.y };
+    }
+    const rx = Math.round(p.x), ry = Math.round(p.y);
+    if (Math.hypot(p.x - rx, p.y - ry) < 0.35) return { x: rx, y: ry };
+    return p;
+}
+
+function pointInPoly(px, py, verts) {
+    let inside = false;
+    for (let i = 0, j = verts.length - 1; i < verts.length; j = i++) {
+        const xi = verts[i].x, yi = verts[i].y;
+        const xj = verts[j].x, yj = verts[j].y;
+        if (((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+function startDraw() {
+    if (manualFlakeSvg) { manualFlakeSvg.remove(); manualFlakeSvg = null; }
+    drawMode = true;
+    drawVertices = [];
+    drawFlakeBtn.textContent = 'Cancel Draw';
+    grid.style.cursor = 'crosshair';
+
+    drawSvg = makeGridOverlay();
+    drawPolyline = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    drawPolyline.setAttribute("fill", "none");
+    drawPolyline.setAttribute("stroke", "#ffd700");
+    drawPolyline.setAttribute("stroke-width", "2");
+    drawPreviewLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    drawPreviewLine.setAttribute("stroke", "#ffd700");
+    drawPreviewLine.setAttribute("stroke-width", "1");
+    drawPreviewLine.setAttribute("stroke-dasharray", "4 3");
+    drawSnapDot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    drawSnapDot.setAttribute("r", "3");
+    drawSnapDot.setAttribute("fill", "#ffd700");
+    drawSvg.appendChild(drawPolyline);
+    drawSvg.appendChild(drawPreviewLine);
+    drawSvg.appendChild(drawSnapDot);
+}
+
+function cancelDraw() {
+    drawMode = false;
+    drawVertices = [];
+    if (drawSvg) { drawSvg.remove(); drawSvg = null; }
+    drawFlakeBtn.textContent = 'Draw Flake';
+    grid.style.cursor = '';
+}
+
+function finishDraw() {
+    if (!precomputedData || drawVertices.length < 3) { cancelDraw(); return; }
+    const verts = drawVertices.slice();
+    lastDrawFinish = Date.now();
+
+    const width = precomputedData.global_axes.width || 51;
+    const height = precomputedData.global_axes.height || 51;
+    const specs = [];
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            if (!pointInPoly(x + 0.5, y + 0.5, verts)) continue;
+            const key = `${(width - 1) - x}_${y}`;
+            const d = precomputedData.pixels[key];
+            if (d && d.norm_spec) specs.push(d.norm_spec);
+        }
+    }
+
+    if (specs.length === 0) {
+        alert("No pixels inside the polygon.");
+        cancelDraw();
+        return;
+    }
+
+    const L = specs[0].length;
+    const mean = new Array(L).fill(0);
+    const std = new Array(L).fill(0);
+    for (const s of specs) for (let i = 0; i < L; i++) mean[i] += s[i];
+    for (let i = 0; i < L; i++) mean[i] /= specs.length;
+    for (const s of specs) for (let i = 0; i < L; i++) std[i] += (s[i] - mean[i]) ** 2;
+    for (let i = 0; i < L; i++) std[i] = Math.sqrt(std[i] / specs.length);
+
+    flakeAvgData = { mean, std, n: specs.length, source: 'manual' };
+
+    // Freeze the overlay as the final closed polygon
+    drawPolyline.remove();
+    drawPreviewLine.remove();
+    drawSnapDot.remove();
+    const polygon = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+    polygon.setAttribute("points", verts.map(v => `${v.x * gridCellSize},${v.y * gridCellSize}`).join(' '));
+    polygon.setAttribute("fill", "rgba(255, 215, 0, 0.08)");
+    polygon.setAttribute("stroke", "#ffd700");
+    polygon.setAttribute("stroke-width", "2");
+    drawSvg.appendChild(polygon);
+    manualFlakeSvg = drawSvg;
+    drawSvg = null;
+    drawMode = false;
+    drawVertices = [];
+    drawFlakeBtn.textContent = 'Draw Flake';
+    grid.style.cursor = '';
+
+    showFlakeAvgBtn.style.display = 'inline-block';
+    showFlakeAvgBtn.click();
+}
+
+drawFlakeBtn.addEventListener('click', () => {
+    if (drawMode) { cancelDraw(); return; }
+    if (!precomputedData) return;
+    startDraw();
+});
+
+grid.addEventListener('click', (e) => {
+    if (!drawMode) return;
+    const raw = gridEventToCell(e);
+    if (drawVertices.length >= 3) {
+        const f = drawVertices[0];
+        if (Math.hypot(raw.x - f.x, raw.y - f.y) < 0.75) { finishDraw(); return; }
+    }
+    const p = snapCellPoint(raw);
+    const last = drawVertices[drawVertices.length - 1];
+    if (last && Math.hypot(p.x - last.x, p.y - last.y) < 0.2) return; // dblclick double-fires click
+    drawVertices.push(p);
+    drawPolyline.setAttribute('points', drawVertices.map(v => `${v.x * gridCellSize},${v.y * gridCellSize}`).join(' '));
+});
+
+grid.addEventListener('mousemove', (e) => {
+    if (!drawMode || !drawSvg) return;
+    const p = snapCellPoint(gridEventToCell(e));
+    drawSnapDot.setAttribute('cx', p.x * gridCellSize);
+    drawSnapDot.setAttribute('cy', p.y * gridCellSize);
+    if (drawVertices.length > 0) {
+        const last = drawVertices[drawVertices.length - 1];
+        drawPreviewLine.setAttribute('x1', last.x * gridCellSize);
+        drawPreviewLine.setAttribute('y1', last.y * gridCellSize);
+        drawPreviewLine.setAttribute('x2', p.x * gridCellSize);
+        drawPreviewLine.setAttribute('y2', p.y * gridCellSize);
+    }
+});
+
+grid.addEventListener('dblclick', (e) => {
+    if (!drawMode) return;
+    if (drawVertices.length >= 3) finishDraw();
+});
+
+document.addEventListener('keydown', (e) => {
+    if (drawMode && e.key === 'Escape') cancelDraw();
 });
 
 mapTypeSelect.addEventListener('change', () => updateHeatmap())
@@ -391,24 +591,73 @@ function makeEditable(spanEl, inputEl, callback) {
 makeEditable(contrastMinVal, contrastMin, updateHeatmap);
 makeEditable(contrastMaxVal, contrastMax, updateHeatmap);
 
+// 532 nm excitation, matching the backend conversion
+function rsToWl(rs) { return 1.0 / (1.0 / 532.0 - rs / 1e7); }
+function wlToRs(wl) { return (1.0 / 532.0 - 1.0 / wl) * 1e7; }
+
+// Indices of the x-axis inside the user's integration range, or null for
+// the full spectrum. The range inputs are interpreted in the current unit.
+function getIntMask() {
+    if (!precomputedData) return null;
+    let lo = parseFloat(intRangeMin.value);
+    let hi = parseFloat(intRangeMax.value);
+    if (isNaN(lo) && isNaN(hi)) return null;
+    const axis = precomputedData.global_axes[currentUnit];
+    if (isNaN(lo)) lo = -Infinity;
+    if (isNaN(hi)) hi = Infinity;
+    if (lo > hi) [lo, hi] = [hi, lo];
+    const mask = [];
+    for (let i = 0; i < axis.length; i++) {
+        if (axis[i] >= lo && axis[i] <= hi) mask.push(i);
+    }
+    return mask;
+}
+
+function integratedIntensity(pixelData, mask) {
+    if (!mask) return pixelData.integrated_intensity;
+    let s = 0;
+    for (let k = 0; k < mask.length; k++) s += pixelData.norm_spec[mask[k]];
+    return s * (pixelData.l_max || 1);
+}
+
+// Strongest fitted peak (largest amplitude), or null if the pixel has no fit
+function getMainPeak(d) {
+    if (!d || !d.fit_success || !d.fit_curves || d.fit_curves.length === 0) return null;
+    let best = d.fit_curves[0];
+    for (const c of d.fit_curves) if (c.a > best.a) best = c;
+    return best;
+}
+
+function getMapValue(pixelData, mapType, mask) {
+    if (mapType === 'integrated_intensity') return integratedIntensity(pixelData, mask);
+    if (mapType === 'peak_pos' || mapType === 'peak_fwhm') {
+        const main = getMainPeak(pixelData);
+        if (!main) return null;
+        return mapType === 'peak_pos' ? main.c : main.w;
+    }
+    return pixelData[mapType];
+}
+
 function updateHeatmap() {
     if (!precomputedData || !precomputedData.pixels) return;
     const mapType = mapTypeSelect.value;
     const minPercent = parseFloat(contrastMin.value) / 100;
     const maxPercent = parseFloat(contrastMax.value) / 100;
-    
+    const mask = mapType === 'integrated_intensity' ? getIntMask() : null;
+
+    const valueByKey = {};
     let vals = [];
     for (const key in precomputedData.pixels) {
-        vals.push(precomputedData.pixels[key][mapType]);
+        const v = getMapValue(precomputedData.pixels[key], mapType, mask);
+        valueByKey[key] = v;
+        if (v !== null && v !== undefined && isFinite(v)) vals.push(v);
     }
-    
-    if (vals.length === 0) return;
-    
+
     vals.sort((a, b) => a - b);
-    
-    let boundMin = vals[Math.floor(minPercent * (vals.length - 1))];
-    let boundMax = vals[Math.floor(maxPercent * (vals.length - 1))];
-    
+
+    let boundMin = vals.length ? vals[Math.floor(minPercent * (vals.length - 1))] : 0;
+    let boundMax = vals.length ? vals[Math.floor(maxPercent * (vals.length - 1))] : 1;
+
     if (boundMin >= boundMax) {
         boundMax = boundMin + 1e-9;
     }
@@ -421,29 +670,40 @@ function updateHeatmap() {
             const h_idx = (width - 1) - x;
             const key = `${h_idx}_${y}`;
             const pixelData = precomputedData.pixels[key];
-            if (!pixelData) continue;
-            
-            let val = pixelData[mapType];
-            
-            if (val < boundMin) val = boundMin;
-            if (val > boundMax) val = boundMax;
-            
-            const ratio = (val - boundMin) / (boundMax - boundMin);
-            const r = Math.floor(255 * ratio);
-            const b = Math.floor(255 * (1 - ratio));
-            
-            if (pixelElements[key]) {
+            if (!pixelData || !pixelElements[key]) continue;
+
+            let val = valueByKey[key];
+
+            if (val === null || val === undefined || !isFinite(val)) {
+                // No value for this map (e.g. pixel not fitted yet)
+                pixelElements[key].style.backgroundColor = '#333';
+            } else {
+                if (val < boundMin) val = boundMin;
+                if (val > boundMax) val = boundMax;
+
+                const ratio = (val - boundMin) / (boundMax - boundMin);
+                const r = Math.floor(255 * ratio);
+                const b = Math.floor(255 * (1 - ratio));
                 pixelElements[key].style.backgroundColor = `rgb(${r}, 0, ${b})`;
-                if (pixelData.changed) {
-                    pixelElements[key].style.border = '1px solid #ff8c00';
-                    pixelElements[key].style.boxSizing = 'border-box';
-                } else {
-                    pixelElements[key].style.border = 'none';
-                }
+            }
+
+            if (pixelData.changed) {
+                pixelElements[key].style.border = '1px solid #ff8c00';
+                pixelElements[key].style.boxSizing = 'border-box';
+            } else {
+                pixelElements[key].style.border = 'none';
             }
         }
     }
 }
+
+intRangeMin.addEventListener('change', updateHeatmap);
+intRangeMax.addEventListener('change', updateHeatmap);
+intRangeReset.addEventListener('click', () => {
+    intRangeMin.value = '';
+    intRangeMax.value = '';
+    updateHeatmap();
+});
 
 let currentX = -1
 let currentY = -1
@@ -454,6 +714,19 @@ let pollInterval = null
 let currentUnit = 'rs'
 let fitEventSource = null;
 let pixelElements = {};
+
+// Manual flake-polygon drawing state. Coordinates are in grid-cell units
+// (floats), converted to px via gridCellSize only when rendering.
+let gridCellSize = 10;
+let autoContourCellPts = null;
+let drawMode = false;
+let drawVertices = [];
+let drawSvg = null;
+let drawPolyline = null;
+let drawPreviewLine = null;
+let drawSnapDot = null;
+let manualFlakeSvg = null;
+let lastDrawFinish = 0;
 
 Plotly.newPlot('chart', [], {
     title: 'Hover over a pixel to view spectra',
@@ -648,7 +921,7 @@ fitBtn.addEventListener('click', async () => {
     fitBtn.disabled = true;
     fitBtn.textContent = "Fitting...";
     
-    activeFitStreams[dsId] = new EventSource(`/fit_stream/${dsId}`);
+    activeFitStreams[dsId] = new EventSource(`/fit_stream/${dsId}?mode=${encodeURIComponent(fitModeSelect.value)}`);
     let count = 0;
     
     activeFitStreams[dsId].onmessage = (e) => {
@@ -663,6 +936,7 @@ fitBtn.addEventListener('click', async () => {
                 fitBtn.disabled = false;
                 fitBtn.textContent = "Fit!";
                 uploadStatus.innerText = `Fitting complete for ${dsName}! ${count} pixels processed.`;
+                updateHeatmap(); // fit-derived maps (peak position/FWHM) are now valid
             }
             return;
         }
@@ -685,6 +959,7 @@ fitBtn.addEventListener('click', async () => {
             // Update local RAM cache
             if (precomputedData && precomputedData.pixels[data.key]) {
                 precomputedData.pixels[data.key].fit_success = data.fit_success;
+                precomputedData.pixels[data.key].fit_mode = data.fit_mode;
                 precomputedData.pixels[data.key].fit_curves = data.fit_curves;
                 precomputedData.pixels[data.key].total_fit_curve = data.total_fit_curve;
                 precomputedData.pixels[data.key].r_squared = data.r_squared;
@@ -769,6 +1044,12 @@ async function initGrid(datasetId) {
         currentFlakeSvg.remove();
         currentFlakeSvg = null;
     }
+    cancelDraw();
+    if (manualFlakeSvg) {
+        manualFlakeSvg.remove();
+        manualFlakeSvg = null;
+    }
+    autoContourCellPts = null;
     
     try {
         const response = await fetch(`/api/data/${datasetId}`)
@@ -787,7 +1068,8 @@ async function initGrid(datasetId) {
         let cellSize = Math.floor(Math.min(maxW / width, maxH / height));
         if (cellSize < 1) cellSize = 1;
         if (cellSize > 15) cellSize = 15;
-        
+        gridCellSize = cellSize;
+
         grid.style.gridTemplateColumns = `repeat(${width}, ${cellSize}px)`;
         grid.style.gridTemplateRows = `repeat(${height}, ${cellSize}px)`;
         grid.style.width = `${width * cellSize}px`;
@@ -795,6 +1077,7 @@ async function initGrid(datasetId) {
         
         // Add double click listener to the grid to unlock if clicking anywhere in the plane
         grid.addEventListener('dblclick', () => {
+            if (drawMode || Date.now() - lastDrawFinish < 300) return;
             if (isLocked) {
                 isLocked = false;
                 coordText.innerText = `(Unlocked) Pixel ${currentX}, ${currentY}`;
@@ -824,6 +1107,7 @@ async function initGrid(datasetId) {
                 })
                 
                 pixel.addEventListener('dblclick', (e) => {
+                    if (drawMode) return; // let it bubble so the draw handler closes the polygon
                     e.stopPropagation(); // prevent grid dblclick from firing immediately
                     if (!isLocked) {
                         isLocked = true;
@@ -843,6 +1127,7 @@ async function initGrid(datasetId) {
         
         updateHeatmap();
         fitBtn.style.display = 'inline-block';
+        fitModeSelect.style.display = 'inline-block';
         resetFitsBtn.style.display = 'inline-block';
         toggleFitsBtn.style.display = 'inline-block';
         
@@ -856,13 +1141,25 @@ async function initGrid(datasetId) {
         console.error("Failed to load data:", e)
         grid.innerHTML = '<div style="color: #ff4d4d; padding: 20px;">Failed to load dataset.</div>'
         fitBtn.style.display = 'none';
+        fitModeSelect.style.display = 'none';
         resetFitsBtn.style.display = 'none';
         toggleFitsBtn.style.display = 'none';
     }
 }
 
 unitSelect.addEventListener('change', () => {
+    const oldUnit = currentUnit;
     currentUnit = unitSelect.value;
+    if (oldUnit !== currentUnit) {
+        // Keep the integration range physically identical across units.
+        // rs↔wl conversion is monotonic increasing, so min/max order holds.
+        const convert = currentUnit === 'wls' ? rsToWl : wlToRs;
+        for (const input of [intRangeMin, intRangeMax]) {
+            const v = parseFloat(input.value);
+            if (!isNaN(v)) input.value = convert(v).toFixed(2);
+        }
+        intRangeUnit.textContent = currentUnit === 'rs' ? 'cm⁻¹' : 'nm';
+    }
     if (currentX !== -1 && currentY !== -1 && precomputedData) {
         const width = precomputedData.global_axes.width;
         // When changing units, force relayout so it rescales to new unit ranges
@@ -925,9 +1222,25 @@ function updateChart(data, x, y, forceRelayout) {
             <b>Pixel (${x}, ${y})</b><br>
             Expected Peaks: <span id="num-peaks-val" style="color: #4d4dff; cursor: pointer; text-decoration: underline;" title="Click to edit">${data.expected_num_peaks || data.num_peaks}</span>
             <input type="number" id="num-peaks-input" style="display: none; width: 40px; background: #333; color: white; border: 1px solid #555;" min="1" max="10" step="1"><br>
-            Total Int = ${data.integrated_intensity ? data.integrated_intensity.toExponential(2) : '0.00e+0'}<br>
+            Total Int = ${data.integrated_intensity ? data.integrated_intensity.toExponential(2) : '0.00e+0'}<br>`;
+    const intMask = getIntMask();
+    if (intMask) {
+        statsHtml += `Int (range) = ${integratedIntensity(data, intMask).toExponential(2)}<br>`;
+    }
+    statsHtml += `
             Sharpness = ${data.sharpness !== undefined && data.sharpness !== null ? data.sharpness.toFixed(3) : 'N/A'}<br>
-            Bg Noise = ${data.bg_noise !== undefined ? data.bg_noise.toFixed(2) : '0.00'} a.u.
+            Bg Level = ${data.bg_noise !== undefined ? data.bg_noise.toFixed(2) : '0.00'} a.u.`;
+    if (data.cosmic_removed) {
+        statsHtml += `<br>Cosmic rays removed = ${data.cosmic_removed}`;
+    }
+    const mainPeak = getMainPeak(data);
+    if (mainPeak) {
+        const posLabel = currentUnit === 'wls'
+            ? `${rsToWl(mainPeak.c).toFixed(2)} nm`
+            : `${mainPeak.c.toFixed(1)} cm⁻¹`;
+        statsHtml += `<br>Main Peak = ${posLabel} (FWHM ${mainPeak.w.toFixed(1)} cm⁻¹)`;
+    }
+    statsHtml += `
         </div>
     `;
     

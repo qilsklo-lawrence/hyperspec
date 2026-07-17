@@ -6,7 +6,71 @@ import time
 import warnings
 import json
 from scipy.signal import find_peaks
-from scipy.ndimage import median_filter
+from scipy.ndimage import median_filter, label
+
+# Laser line FWHM in nm: no real spectral feature can be narrower than this,
+# so anything narrower is a cosmic ray / readout artifact.
+LASER_FWHM_NM = 0.5
+
+def remove_cosmic_rays(specs, wls, laser_fwhm_nm=LASER_FWHM_NM, threshold_sigma=8.0):
+    """Remove cosmic-ray spikes from an (n_spectra, n_channels) array.
+
+    A median filter spanning 2x the laser FWHM erases any feature
+    narrower than the laser line, giving a spike-free reference. Points
+    more than threshold_sigma noise-sigmas above the reference are spike
+    candidates; candidate runs at least as wide as the laser FWHM are
+    real (laser-limited) lines and are kept, narrower runs cannot be
+    real signal and get replaced with the reference value.
+    Returns (cleaned_specs, spikes_removed_per_spectrum).
+    """
+    specs = np.asarray(specs, dtype=np.float64)
+    dwl = np.median(np.abs(np.diff(np.asarray(wls, dtype=np.float64))))
+    if not np.isfinite(dwl) or dwl <= 0:
+        return specs, np.zeros(len(specs), dtype=int)
+    w_laser = laser_fwhm_nm / dwl  # laser FWHM in channels
+    win = min(31, max(5, int(np.ceil(2 * w_laser)) | 1))
+    filtered = median_filter(specs, size=(1, win), mode='nearest')
+    resid = specs - filtered
+    # Per-spectrum noise from first differences — immune to peaks and to
+    # the zero-inflated distribution of median-filter residuals.
+    dz = np.diff(specs, axis=1)
+    noise = 1.4826 * np.median(np.abs(dz - np.median(dz, axis=1, keepdims=True)),
+                               axis=1, keepdims=True) / np.sqrt(2)
+    noise[noise <= 0] = np.inf  # flat spectra: nothing to flag
+    spikes = resid > threshold_sigma * noise  # cosmic rays are always positive
+    if spikes.any():
+        # Contiguous flagged runs as wide as the laser line are real peaks
+        along_row = np.array([[0, 0, 0], [1, 1, 1], [0, 0, 0]])
+        run_labels, n_runs = label(spikes, structure=along_row)
+        if n_runs:
+            run_sizes = np.bincount(run_labels.ravel())
+            is_real = run_sizes >= w_laser
+            is_real[0] = False
+            spikes &= ~is_real[run_labels]
+    cleaned = np.where(spikes, filtered, specs)
+    return cleaned, spikes.sum(axis=1).astype(int)
+
+def snip_baseline(specs, max_half_window=None):
+    """Per-spectrum background via the SNIP algorithm (min-of-neighbor-
+    averages with a shrinking window), vectorized across all spectra.
+
+    Runs in the linear domain: the min operator alone keeps the baseline
+    from climbing peaks, while the usual LLS transform's concavity would
+    bias sloped backgrounds low. The baseline can only contain features
+    wider than max_half_window channels (default: a quarter of the
+    spectrum), so peaks — including broad PL bands — survive.
+    float32 halves memory traffic; precision is far below the noise floor.
+    """
+    specs = np.asarray(specs, dtype=np.float64)
+    n = specs.shape[1]
+    if max_half_window is None:
+        max_half_window = max(1, n // 4)
+    v = specs.astype(np.float32)
+    for p in range(max_half_window, 0, -1):
+        avg = 0.5 * (v[:, :-2 * p] + v[:, 2 * p:])
+        core = v[:, p:-p]
+        np.minimum(core, avg, out=core)
+    return v.astype(np.float64)
 
 def recommend_peak_count(x, y, min_distance=20):
     y = np.asarray(y)
@@ -72,12 +136,22 @@ def process_h5(h5_path, progress_callback=None):
 
     rs = rs_raw
     precomputed_data = {'pixels': {}}
-    
+
     total_pixels = v_steps * h_steps
     pixel_count = 0
 
     global_min_y = float('inf')
     global_max_y = float('-inf')
+
+    # Whole-map cleanup before the per-pixel loop: despike, then estimate
+    # a per-pixel SNIP background. Row index = v * h_steps + h.
+    spec_flat = spec_map.reshape(total_pixels, -1).astype(np.float64)
+    if progress_callback:
+        progress_callback(0, total_pixels, "Removing cosmic rays")
+    spec_flat, spike_counts = remove_cosmic_rays(spec_flat, wls)
+    if progress_callback:
+        progress_callback(0, total_pixels, "Estimating background (SNIP)")
+    baselines = snip_baseline(spec_flat)
 
     for v in range(v_steps):
         for h in range(h_steps):
@@ -85,11 +159,9 @@ def process_h5(h5_path, progress_callback=None):
             if progress_callback and pixel_count % 200 == 0:
                 progress_callback(pixel_count, total_pixels, f"Processing pixel {h}, {v}")
 
-            spec = spec_map[v, h, :]
-            
-            # Simple baseline subtraction and normalization for preview
-            bg_noise = np.percentile(spec, 5) 
-            spec_sub = spec - bg_noise
+            row = v * h_steps + h
+            bg_noise = float(np.mean(baselines[row]))
+            spec_sub = spec_flat[row] - baselines[row]
             l_max = np.max(spec_sub) if np.max(spec_sub) > 0 else 1.0
             norm_spec = spec_sub / l_max
             norm_spec = np.nan_to_num(norm_spec, nan=0.0)
@@ -119,6 +191,7 @@ def process_h5(h5_path, progress_callback=None):
                 'l_max': round(float(l_max), 2),
                 'num_peaks': num_peaks,
                 'peak_indices': peak_indices,
+                'cosmic_removed': int(spike_counts[row]),
                 # Fit fields initialized empty
                 'fit_curves': [],
                 'fit_success': False
@@ -193,6 +266,15 @@ def process_mat(mat_path, progress_callback=None):
     # Convert wls to rs roughly if needed
     rs = (1/532.0 - 1/wls) * 1e7
 
+    # Whole-map cleanup: despike, then per-pixel SNIP background.
+    raw = np.asarray(raw, dtype=np.float64)
+    if progress_callback:
+        progress_callback(0, total_pixels, "Removing cosmic rays")
+    raw, spike_counts = remove_cosmic_rays(raw, wls)
+    if progress_callback:
+        progress_callback(0, total_pixels, "Estimating background (SNIP)")
+    baselines = snip_baseline(raw)
+
     for y_idx in range(v_steps):
         for x_idx in range(h_steps):
             pixel_count += 1
@@ -205,10 +287,8 @@ def process_mat(mat_path, progress_callback=None):
                 continue
                 
             idx = int(mat_idx) - 1 # 1-based indexing in Matlab
-            spec = raw[idx, :]
-            
-            bg_noise = np.percentile(spec, 5) 
-            spec_sub = spec - bg_noise
+            bg_noise = float(np.mean(baselines[idx]))
+            spec_sub = raw[idx, :] - baselines[idx]
             l_max = np.max(spec_sub) if np.max(spec_sub) > 0 else 1.0
             norm_spec = spec_sub / l_max
             norm_spec = np.nan_to_num(norm_spec, nan=0.0)
@@ -239,6 +319,7 @@ def process_mat(mat_path, progress_callback=None):
                 'l_max': round(float(l_max), 2),
                 'num_peaks': num_peaks,
                 'peak_indices': peak_indices,
+                'cosmic_removed': int(spike_counts[idx]),
                 'fit_curves': [],
                 'fit_success': False
             }
