@@ -7,7 +7,6 @@ import threading
 import time
 import uuid
 import urllib.request
-from collections import OrderedDict
 from datetime import timedelta
 
 import numpy as np
@@ -67,12 +66,6 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 # overrides, fits, ...) can never be observed through another principal's key.
 datasets = {}
 processing_status = {}   # (principal, dataset_id) -> status dict
-
-# Pristine (never-mutated) precompute results, content-addressed by sha256 and
-# kept as JSON *text* so handing a copy to a principal always deserializes into
-# an independent object. Small LRU; GCS/local disk back it (see _pristine_*).
-_pristine_text: OrderedDict = OrderedDict()
-_PRISTINE_MEM_MAX = 8
 
 DEFAULT_NAME = 'default (MAPPING.h5)'
 default_dataset = None
@@ -136,12 +129,11 @@ def _gcs_delete(path):
 # ── Per-principal storage layout ──────────────────────────────────────────────
 # ORCiD users (durable, shared by every Hyperspec container):
 #   gs://<bucket>/users/<orcid>/registry.json           {id: {name, sha256}}
-#   gs://<bucket>/users/<orcid>/datasets/<id>.json      mutated working copies
-# Shared content-addressed caches (pristine only, never mutated):
-#   gs://<bucket>/cache/precomputed/<sha256>.json
-#   gs://<bucket>/cache/raw/<sha256>/<filename>
+#   gs://<bucket>/users/<orcid>/datasets/<id>.json      working copies
 # Anonymous users: registry lives in the session cookie; working copies in
 # memory + this container's disk (ephemeral by design).
+# Every upload is processed fresh — there is deliberately no shared cache of
+# precompute results, so pipeline improvements always apply immediately.
 
 def _registry_path(orcid):
     return f'users/{orcid}/registry.json'
@@ -149,14 +141,6 @@ def _registry_path(orcid):
 
 def _workcopy_path(orcid, dsid):
     return f'users/{orcid}/datasets/{dsid}.json'
-
-
-def _cache_json_path(sha):
-    return f'cache/precomputed/{sha}.json'
-
-
-def _cache_raw_path(sha, filename):
-    return f'cache/raw/{sha}/{filename}'
 
 
 def _pid_token(principal):
@@ -168,12 +152,6 @@ def _anon_work_path(principal, dsid):
     d = os.path.join(UPLOAD_FOLDER, 'anon_work', _pid_token(principal))
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, f'{dsid}.json')
-
-
-def _local_cache_path(sha):
-    d = os.path.join(UPLOAD_FOLDER, 'cache')
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, f'{sha}.json')
 
 
 # ── Registry: which dataset ids a principal may touch ─────────────────────────
@@ -213,49 +191,13 @@ def registry_remove(principal, dsid):
             session.modified = True
 
 
-# ── Pristine content cache ────────────────────────────────────────────────────
-
-def _pristine_load(sha):
-    """Pristine precompute JSON text for a content hash, or None."""
-    if not sha:
-        return None
-    if sha in _pristine_text:
-        _pristine_text.move_to_end(sha)
-        return _pristine_text[sha]
-    text = None
-    local = _local_cache_path(sha)
-    if os.path.exists(local):
-        with open(local, 'r') as f:
-            text = f.read()
-    if text is None:
-        text = _gcs_read_text(_cache_json_path(sha))
-        if text is not None:
-            with open(local, 'w') as f:
-                f.write(text)
-    if text is not None:
-        _pristine_text[sha] = text
-        while len(_pristine_text) > _PRISTINE_MEM_MAX:
-            _pristine_text.popitem(last=False)
-    return text
-
-
-def _pristine_store(sha, text):
-    _pristine_text[sha] = text
-    while len(_pristine_text) > _PRISTINE_MEM_MAX:
-        _pristine_text.popitem(last=False)
-    with open(_local_cache_path(sha), 'w') as f:
-        f.write(text)
-    _gcs_write_text(_cache_json_path(sha), text)
-
-
 # ── Working-copy access ───────────────────────────────────────────────────────
 
 def load_working(principal, dsid):
     """Return the dataset visible to `principal` under `dsid`, or None.
 
     Resolution order: in-memory working copy → persisted working copy
-    (GCS for orcid, local disk for anon) → pristine content cache (via the
-    sha recorded in the principal's registry). The shared demo `default` is
+    (GCS for orcid, local disk for anon). The shared demo `default` is
     readable by everyone; reads get the shared object, writes go through
     ensure_writable() which makes a private copy first.
     """
@@ -288,11 +230,6 @@ def load_working(principal, dsid):
             datasets[key] = data
             return data
 
-    text = _pristine_load(entry.get('sha256'))
-    if text is not None:
-        data = json.loads(text)
-        datasets[key] = data
-        return data
     return None
 
 
@@ -332,18 +269,7 @@ def _sha256_file(filepath):
     return h.hexdigest()
 
 
-def _cache_raw_store(filepath, sha, filename):
-    """Best-effort: keep the raw bytes content-addressed in GCS so identical
-    future imports never re-transfer them."""
-    try:
-        blob = _bucket().blob(_cache_raw_path(sha, filename))
-        if not blob.exists():
-            blob.upload_from_filename(filepath)
-    except Exception as e:
-        print(f"raw cache store failed for {sha}: {e}")
-
-
-def process_file_background(principal, filepath, dsid, sha, filename):
+def process_file_background(principal, filepath, dsid):
     key = (principal, dsid)
     processing_status[key] = {'status': 'processing', 'current': 0, 'total': 1,
                               'message': 'Initializing...'}
@@ -354,10 +280,10 @@ def process_file_background(principal, filepath, dsid, sha, filename):
 
     try:
         data = process_h5(filepath, progress_callback=update_progress)
-        # Store the pristine result first — dedupe for everyone — then hand
-        # this principal their own working copy.
-        _pristine_store(sha, json.dumps(data, separators=(',', ':')))
         datasets[key] = data
+        # Persist immediately — the working copy is the only durable record
+        # of this dataset (GCS for orcid, local disk for anon).
+        flush_working(principal, dsid)
         processing_status[key] = {'status': 'done', 'dataset_id': dsid}
     except Exception as e:
         registry_remove_safe = auth.is_orcid(principal)
@@ -390,18 +316,8 @@ def ingest_local_file(principal, filepath, filename):
         os.remove(filepath)
         return dsid, True
 
-    text = _pristine_load(sha)
-    if text is not None:
-        # Someone (possibly this user, possibly not) already paid for the
-        # precompute of these exact bytes — reuse the result, own copy.
-        datasets[key] = json.loads(text)
-        processing_status[key] = {'status': 'done', 'dataset_id': dsid}
-        os.remove(filepath)
-        return dsid, duplicate
-
-    _cache_raw_store(filepath, sha, filename)
     threading.Thread(target=process_file_background,
-                     args=(principal, filepath, dsid, sha, filename),
+                     args=(principal, filepath, dsid),
                      daemon=True).start()
     return dsid, duplicate
 
@@ -787,8 +703,6 @@ def delete_dataset(dataset_id):
         local = _anon_work_path(principal, dataset_id)
         if os.path.exists(local):
             os.remove(local)
-    # The shared content cache (cache/…) is intentionally kept: it holds only
-    # pristine derived data, and other principals may reference the same hash.
     return jsonify({"success": True})
 
 
