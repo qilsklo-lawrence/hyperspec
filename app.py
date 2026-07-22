@@ -742,15 +742,19 @@ def get_dataset(dataset_id):
     for _ in range(600):  # up to 60 seconds
         data = load_working(principal, dataset_id)
         if data is not None:
+            import gzip
             payload = json.dumps(data)
+            compressed = gzip.compress(payload.encode('utf-8'), compresslevel=1)
 
-            # Stream in chunks: Cloud Run caps non-chunked responses at 32 MiB
-            # and large datasets (e.g. the 88 MB default) exceed that.
-            def generate(text=payload):
-                for i in range(0, len(text), 4 * 1024 * 1024):
-                    yield text[i:i + 4 * 1024 * 1024]
+            # Stream compressed chunks: Cloud Run caps non-chunked responses at 32 MiB,
+            # and large datasets exceed that even when compressed.
+            def generate():
+                for i in range(0, len(compressed), 1024 * 1024):
+                    yield compressed[i:i + 1024 * 1024]
 
-            return Response(generate(), mimetype='application/json')
+            response = Response(generate(), mimetype='application/json')
+            response.headers['Content-Encoding'] = 'gzip'
+            return response
         status = processing_status.get((principal, dataset_id))
         if status is not None and status.get('status') == 'error':
             return jsonify({"error": status.get('error')}), 500
